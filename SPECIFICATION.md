@@ -546,6 +546,13 @@ the file browser remains a first-class destination reachable from the nav. Struc
    core events), READ-filtered per viewer. This is the Phase 3 "calm awareness" projection rendered
    in-app (no badges, no interrupt) — the same source the email digest (§11) draws from.
 
+**Attention surfaces share one source.** The dashboard attention feed, the in-preview collapsed flag
+(§10b-i), and the email digest (§11) are three renderings of the *same* underlying state — the
+`notifications`, `mentions`, and `review_requests` records (§4), always re-checked with
+`can_read(file_uid)` per viewer. There is no per-surface attention logic to drift: a mention or review
+that lights the preview flag is the same row that appears in the dashboard feed and (on the receiver's
+cadence) the digest email, and it clears everywhere at once when resolved. Consistency by construction.
+
 Client/store to add (matching `csaiClient.ts` + `stores/auth.ts`):
 `src/services/discussionClient.ts` (axios, base `/discuss` via `VITE_DISCUSS_BASE`, attaches
 `Authorization` + `X-Tenant`, 401 non-fatal like CSAI), `src/services/discussionService.ts`,
