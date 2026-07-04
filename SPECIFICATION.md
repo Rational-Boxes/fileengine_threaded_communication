@@ -552,12 +552,34 @@ Client/store to add (matching `csaiClient.ts` + `stores/auth.ts`):
 `src/stores/discussion.ts` (`attention`, `activity`, `filters`, `loading`; poll or SSE — **no
 websocket-push badge**).
 
-### 10b. Inline thread panel
-A `ThreadPanel.vue` component embedded in `PreviewView` and the `FileDetailsDrawer`, showing/adding
-threads for the open document (anchored to the file/version). This is where most commenting actually
-happens (on the document), the dashboard being the aggregation surface. *Pinning a thread to a
-specific in-document entity (xeokit BIM element, PDF page-region) is deferred to V2 (§1); v1 anchors
-at the document/version level.*
+### 10b. Inline thread panel (preview integration)
+A `ThreadPanel.vue` component embedded in `PreviewView` (and reachable from the `FileDetailsDrawer`),
+showing/adding threads for the open document (anchored to the file/version). This is where most
+commenting actually happens (on the document), the dashboard being the aggregation surface. *Pinning
+a thread to a specific in-document entity (xeokit BIM element, PDF page-region) is deferred to V2
+(§1); v1 anchors at the document/version level.*
+
+**Layout — user-configurable placement.** The panel's position within the preview is a user choice,
+switchable from a control in the panel/preview header, with three modes:
+
+| Mode | Behaviour |
+|------|-----------|
+| **Collapsed** | Panel hidden; only a compact affordance (a "Comments (N)" toggle/tab, with an unread/attention marker) remains, so the preview gets the full viewport. Default when there are no threads. |
+| **Pinned right** | Panel docked as a right-hand sidebar; the preview content reflows to the remaining width. Best for tall/portrait documents and wide screens. Default when threads exist on a wide screen. |
+| **Pinned bottom** | Panel docked as a bottom drawer; the preview reflows to the remaining height. Best for wide/landscape content and 3D/BIM views. |
+
+Details:
+- **Persisted preference.** The chosen mode is remembered in `localStorage` (e.g.
+  `fe.discuss.panelLayout`), mirroring the existing viewer-preference convention (e.g. the model
+  viewer's `fe.model3d.sidebarCollapsed`). It is a per-browser UI preference, **not** server state —
+  distinct from the digest subscription (§11a), which is durable per-user config.
+- **Reflow, not overlay.** Pinned modes resize the preview surface rather than floating over it, so
+  document content and 3D viewers stay fully visible; on mode change, viewer canvases are told to
+  resize (the same pattern the model-viewer overlay uses when its sidebar toggles).
+- **Responsive fallback.** On narrow viewports "pinned right" degrades to "pinned bottom" (or a
+  full-screen sheet) automatically; the stored preference is retained and re-applied when width allows.
+- **Switching never loses draft state** — an in-progress comment in the `CommentEditor` (§10c)
+  survives a layout change (collapse/expand/redock).
 
 ### 10c. Comment editor
 A `CommentEditor.vue` component (used by `ThreadPanel`, the new-thread form, and the review-request
@@ -765,8 +787,9 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
    `notifications` writes; emit `discussion:events`.
 4. **M3 — indexing & RAG:** `comment_chunks` embed/store; comment search; CSAI retrieval integration
    (Option A internal retrieve endpoint, §6).
-5. **M4 — dashboard:** `/dashboard/attention` + `/dashboard/activity`; `document_activity` projection;
-   SPA view, `ThreadPanel`, client/store.
+5. **M4 — dashboard & preview panel:** `/dashboard/attention` + `/dashboard/activity`;
+   `document_activity` projection; SPA view, client/store; `ThreadPanel` in `PreviewView` with the
+   collapsed / pinned-right / pinned-bottom layout modes (§10b).
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
    source type; resolving-version links.
 7. **M6 — email digest (Phase 3 delivery):** `digest_subscriptions`/`digest_deliveries`;
@@ -802,6 +825,9 @@ reusing the same builder.
    an **hourly cron** `discuss-digest` sender that self-selects due users; per-recipient ACL filtering,
    per-period idempotency, opt-in AI summary, quiet-if-empty. Email + in-app only — **no per-event
    push** (Phase 3 delivery; the Phase 2 substrate is a prerequisite).
+9. **Preview panel layout (§10b):** the inline `ThreadPanel` in `PreviewView` is user-switchable
+   between **collapsed / pinned-right / pinned-bottom**, persisted per-browser in `localStorage`;
+   pinned modes reflow the preview (no overlay).
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
