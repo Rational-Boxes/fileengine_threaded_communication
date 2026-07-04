@@ -1,0 +1,37 @@
+"""Request-scoped identity + authorization dependencies for the HTTP surface.
+
+``identity`` resolves the caller (Basic/Bearer + tenant); ``require_tenant_admin``
+gates the administrator-only surfaces (redaction §5b, invisible viewing §10h).
+
+M0 note: admin is determined from the caller's resolved roles (``administrators`` /
+``system_admin``, mapped at LDAP auth time — see ldap_auth.Identity.is_admin). A
+stricter authoritative LDAP group check (as ldap_manager does) can replace this
+without changing call sites.
+"""
+from fastapi import HTTPException, Request
+
+from .http_auth import extract_tenant, resolve_identity
+from .ldap_auth import Identity
+
+
+def identity(request: Request) -> Identity:
+    """Resolve the requesting user from Authorization (Basic/Bearer) + tenant, or 401."""
+    config = request.app.state.config
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    tenant = extract_tenant(headers, headers.get("host", ""), config.tenant)
+    ident = resolve_identity(
+        headers.get("authorization", ""), tenant, config,
+        request.app.state.token_store,
+        getattr(request.app.state, "bridge_verifier", None),
+    )
+    if ident is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return ident
+
+
+def require_tenant_admin(request: Request) -> Identity:
+    """Identity of a tenant administrator, or 403."""
+    ident = identity(request)
+    if not ident.is_admin:
+        raise HTTPException(status_code=403, detail="tenant administrator required")
+    return ident
