@@ -509,6 +509,9 @@ GET    /dashboard/attention                   # merged, ACL-filtered notificatio
 POST   /dashboard/attention/{id}/seen         # mark seen (state only; not a badge system)
 GET    /dashboard/activity                    # new/updated documents the caller may see (from core events, READ-filtered)
 
+# Per-file attention flags (batch — for the file browser row badges, §10e)
+POST   /attention/flags                       # {file_uids:[…]} → {uid: {mentions, reviews}} for the caller (one round-trip)
+
 # Email-digest self-service (§11a)
 GET    /me/digest                             # read the caller's digest subscription
 PUT    /me/digest                             # update {cadence, send_hour_local, send_dow, timezone, scope, ai_summary, quiet_if_empty}
@@ -546,12 +549,13 @@ the file browser remains a first-class destination reachable from the nav. Struc
    core events), READ-filtered per viewer. This is the Phase 3 "calm awareness" projection rendered
    in-app (no badges, no interrupt) — the same source the email digest (§11) draws from.
 
-**Attention surfaces share one source.** The dashboard attention feed, the in-preview collapsed flag
-(§10b-i), and the email digest (§11) are three renderings of the *same* underlying state — the
-`notifications`, `mentions`, and `review_requests` records (§4), always re-checked with
-`can_read(file_uid)` per viewer. There is no per-surface attention logic to drift: a mention or review
-that lights the preview flag is the same row that appears in the dashboard feed and (on the receiver's
-cadence) the digest email, and it clears everywhere at once when resolved. Consistency by construction.
+**Attention surfaces share one source.** The dashboard attention feed, the file-browser row flags
+(§10e), the in-preview collapsed flag (§10b-i), and the email digest (§11) are four renderings of the
+*same* underlying state — the `notifications`, `mentions`, and `review_requests` records (§4), always
+re-checked with `can_read(file_uid)` per viewer. There is no per-surface attention logic to drift: a
+mention or review that lights the file-list badge is the same row that lights the preview flag,
+appears in the dashboard feed, and (on the receiver's cadence) the digest email — and it clears
+everywhere at once when resolved. Consistency by construction.
 
 Client/store to add (matching `csaiClient.ts` + `stores/auth.ts`):
 `src/services/discussionClient.ts` (axios, base `/discuss` via `VITE_DISCUSS_BASE`, attaches
@@ -627,7 +631,27 @@ frequency** (`off` / `hourly` / `daily` / `weekly`), preferred time/day, scope (
 also activity for chosen trees/tags), AI-summary opt-in, and quiet-if-empty. Includes a **"Send me a
 digest now"** button (`POST /me/digest/send-now`). This is the UI over the §11 email digest.
 
----
+### 10e. File-list attention flags
+The file browser (`FileBrowserView` / `useFileStore`) shows a per-row **attention flag** on any file
+where the current user has something waiting — so a mention or review request is visible while
+browsing, before opening the document. Same two states as the collapsed preview flag (§10b-i),
+drawn from the same records:
+
+- **Flagged** — the user is `@mention`ed in an unresolved thread on that file (`mentions`, §4).
+- **Needs review** — the user is the `reviewer` on a `requested`/`acknowledged` `review_requests` row
+  for that file (§4).
+
+Rendered as a compact badge/icon in a list column (with a combined count when both apply), matching
+the browser's existing row affordances; folders may roll up a subtree total (optional, later).
+
+- **Batch fetch, not N calls.** For a directory listing the SPA makes **one** call —
+  `POST /attention/flags {file_uids:[…]}` (§9) — returning per-uid `{mentions, reviews}` **only for
+  the caller**, so a full folder is annotated in a single round-trip. Results are cached in
+  `useFileStore` and refreshed on navigation.
+- **ACL-scoped & consistent.** Flags are computed as the caller (a flag only exists on a file they can
+  READ — guaranteed anyway, since a mention/review can't target a user without READ, §5.1) and clear
+  as the underlying items resolve. This is the **same source** as the dashboard feed, preview flag,
+  and digest (§10a) — the file-list is simply a fourth rendering of it.
 
 ## 11. Email digest — user-configurable, cron-driven
 
@@ -806,9 +830,10 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
    `notifications` writes; emit `discussion:events`.
 4. **M3 — indexing & RAG:** `comment_chunks` embed/store; comment search; CSAI retrieval integration
    (Option A internal retrieve endpoint, §6).
-5. **M4 — dashboard & preview panel:** `/dashboard/attention` + `/dashboard/activity`;
+5. **M4 — dashboard, preview panel & file-list flags:** `/dashboard/attention` + `/dashboard/activity`;
    `document_activity` projection; SPA view, client/store; `ThreadPanel` in `PreviewView` with the
-   collapsed / pinned-right / pinned-bottom layout modes (§10b).
+   collapsed / pinned-right / pinned-bottom layout modes (§10b); batch `POST /attention/flags` +
+   file-browser row badges (§10e).
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
    source type; resolving-version links.
 7. **M6 — email digest (Phase 3 delivery):** `digest_subscriptions`/`digest_deliveries`;
@@ -848,6 +873,9 @@ reusing the same builder.
    between **collapsed / pinned-right / pinned-bottom**, persisted per-browser in `localStorage`;
    pinned modes reflow the preview (no overlay). Collapsed shows the **comment count** plus an
    **attention flag** when the user is @mentioned (flagged) or has a pending review here.
+10. **File-list attention flags (§10e):** the file browser shows per-row **flagged** (@mention) /
+   **needs-review** badges for the caller, fetched for a whole directory in one batch call
+   (`POST /attention/flags`). Fourth rendering of the one shared attention source (§10a).
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
