@@ -38,16 +38,22 @@ anchor document** — the service invents no access model of its own.
 The following are **forbidden**, not merely deferred. No feature ships that violates them,
 even behind a flag:
 - **No channels, no DMs.** Discussion exists *only* where a document anchors it.
-- **No presence, no typing indicators, no unread badges.** These stay forbidden.
+- **No global presence, no typing indicators, no unread badges.** No app-wide "who's online", no
+  keystroke indicators, no count badges.
 - **No push notifications in v1.** Awareness is async-first: dashboard + (Phase 3) digest.
 - The dashboard is a *projection of permissioned data the core already emits* — never a
   second, parallel messaging system.
 
-**The one bounded real-time exception:** when two users have the *same document's* comment panel open
-at once, new comments sync **live** between them (§10h) — collaborative comment editing, like a shared
-document, not a notification/interrupt surface. It is confined to an already-open shared panel and
-carries **only posted content**, never presence or typing indicators. Every *other* surface (dashboard,
-file-list flags, digest) stays async and poll-based. This is the sole carve-out from "non-real-time".
+**Two bounded real-time exceptions — both confined to an *already-open* shared comment panel on the
+same file (§10h), never global, never push:**
+1. **Live comment sync** — comments posted from one open panel appear live in the others (collaborative
+   comment editing, like a shared document).
+2. **Local co-viewing presence** — that panel shows when *other users are viewing/commenting on this
+   same file* right now (a small "also here" roster/count), so co-reviewers know they aren't alone.
+
+Both live only while the panel is open and vanish when it closes. Still forbidden everywhere:
+**app-wide presence, typing indicators, unread badges, and per-event push.** Every *other* surface
+(dashboard, file-list flags, digest) stays async and poll-based.
 
 ### Deferred to a V2 specification
 **Association of comments to entities *inside* a document — especially 3D model elements — is
@@ -704,37 +710,58 @@ document surface**.
 - The §10b layout modes don't apply here (there's nothing to reflow around) — the panel simply owns
   the window. Comment deep-linking, flags, and digest links behave identically.
 
-### 10h. Real-time comment sync — the one live exception
-The project is async-first and quiet by default (§1). The **single** deliberate exception: when two
-or more users have the **same document's** comment panel open at once, comments post **live** between
-them — a new reply, edit, redaction, resolution, or new thread appears within a second, so
-co-reviewers aren't typing over a stale view. This is collaborative comment editing (think shared-doc
-comments), scoped so it never becomes the interrupt machine the project refuses to build:
+### 10h. Real-time in the open panel — the two bounded exceptions
+The project is async-first and quiet by default (§1). The **only** real-time behaviour lives inside an
+*already-open* comment panel on a shared file, and takes two forms, both of which vanish the moment
+the panel closes:
+
+**(1) Live comment sync.** When two or more users have the **same document's** comment panel open at
+once, comments post **live** between them — a new reply, edit, redaction, resolution, or new thread
+appears within a second, so co-reviewers aren't working over a stale view (collaborative comment
+editing, think shared-doc comments).
+
+**(2) Local co-viewing presence.** The panel shows a small **"also here"** indicator — a roster (or a
+count when large) of the *other users currently viewing/commenting on this same file*. It answers only
+"am I looking at this with someone right now?", so co-reviewers coordinate instead of colliding.
+
+Scoped so neither becomes the interrupt machine the project refuses to build:
 
 - **Only within an open shared panel.** A client subscribes to a file's live channel when its
   `ThreadPanel` / pure comment window (§10g) is open on that file, and unsubscribes on close or
   navigation. There is **no global live surface**: the dashboard, file-list flags (§10e), and digests
   stay poll/async — the §10a "no websocket-push badge" rule is unchanged.
-- **Content only — no presence, no typing.** Subscribers receive *posted content* for that file
-  (new/edited/redacted comment, new thread, resolve/reopen). They are **not** shown who else is
-  viewing, nor typing indicators — both remain forbidden (§1). The line: broadcast what was actually
-  said, never who is lurking or mid-keystroke.
-- **ACL-gated per push.** Delivery re-checks READ for each subscriber (guards against a mid-session
-  ACL change); no content reaches a socket whose user has lost access. A redaction (§5b) propagates
-  as a *mask*, never re-broadcasting the original.
+- **Not global presence, not typing.** Co-viewing presence is **per-file and ephemeral** — never an
+  app-wide "who's online", and there are **no typing indicators** (those remain forbidden, §1). The
+  line: show who is in *this* panel and what was actually posted — never who is online elsewhere, nor
+  who is mid-keystroke.
+- **ACL-gated.** Comment delivery re-checks READ for each subscriber (guards against a mid-session ACL
+  change); no content reaches a socket whose user has lost access, and a redaction (§5b) propagates as
+  a *mask*, never re-broadcasting the original. The presence roster likewise only lists users who hold
+  READ on the file (guaranteed — they have the panel open) and shows only their display identity, no
+  location or activity beyond "here".
+- **New content flashes in.** A comment or thread that arrives live is briefly **highlighted with a
+  CSS flash/fade** as it appears (a background pulse settling to normal over ~1–2 s), so the eye is
+  drawn to exactly what changed rather than hunting the thread. This reuses the same highlight
+  treatment a deep-linked comment gets (§10f), and honours `prefers-reduced-motion` (reduced to a
+  static, briefly-tinted background — no animation).
 - **Enhancement, never required.** If the live channel is down, the panel silently falls back to its
-  normal load plus a refresh-on-focus — nothing breaks. Local optimistic echo is reconciled against
-  the authoritative insert (dedupe by comment id).
+  normal load plus a refresh-on-focus, and simply omits the presence indicator — nothing breaks. Local
+  optimistic echo is reconciled against the authoritative insert (dedupe by comment id).
 
 **Transport & fan-out:**
 - A WebSocket endpoint `WS /files/{file_uid}/live` (bridge token via `?token=`, tenant via
-  `?tenant=`/host), following the CSAI chat-WS auth pattern (§7). One subscription per open panel.
+  `?tenant=`/host), following the CSAI chat-WS auth pattern (§7). One subscription per open panel; it
+  carries both comment events and presence.
 - On a comment mutation the service persists it, emits the durable `discussion:events` (for digests),
   **and** publishes to a per-file live channel — Redis pub/sub `discussion:live:<tenant>:<file_uid>` —
   so sockets on **any** service replica receive it (multi-instance safe). The live channel is
   best-effort/ephemeral; `notifications` + the DB remain the source of truth.
+- **Presence** is tracked ephemerally: each open socket registers in a Redis set
+  `discussion:viewers:<tenant>:<file_uid>` with a heartbeat TTL, so a crashed/closed client expires
+  automatically; joins/leaves broadcast an updated roster to the file's subscribers. Never persisted.
 - Heartbeat + idle timeout close abandoned sockets; on reconnect the client re-syncs by fetching
-  comments since its last-seen id. Guardrail: `DISC_LIVE_MAX_CONNS` caps concurrent sockets.
+  comments since its last-seen id. Guardrails: `DISC_LIVE_MAX_CONNS` caps concurrent sockets;
+  `DISC_PRESENCE_TTL_S` bounds roster staleness.
 
 ---
 
@@ -872,9 +899,11 @@ plus SMTP (`DISC_SMTP_HOST/PORT/USER/PASSWORD`, `DISC_DIGEST_FROM`).
   (`UNIQUE (user_id, period_key)`); a **run lock** prevents overlapping cron ticks double-sending;
   AI summary and SMTP are best-effort and must never abort the batch; a send failure leaves the
   period unmarked for retry, bounded to avoid poison-user loops.
-- **Live sync (§10h):** best-effort and enhancement-only — a failed live channel never blocks a write
-  or read; ACL is re-checked per push; cross-replica fan-out via Redis pub/sub; the DB/`notifications`
-  stay the source of truth; concurrent sockets capped (`DISC_LIVE_MAX_CONNS`).
+- **Live sync & presence (§10h):** best-effort and enhancement-only — a failed live channel never
+  blocks a write or read; ACL is re-checked per push; cross-replica fan-out via Redis pub/sub; the
+  DB/`notifications` stay the source of truth. Co-viewing presence is **ephemeral** (Redis set with
+  heartbeat TTL, never persisted, per-file only — no global presence). Sockets capped
+  (`DISC_LIVE_MAX_CONNS`); roster staleness bounded (`DISC_PRESENCE_TTL_S`).
 - **DB failover:** master/replica with read-only degradation, reusing CSAI's `db.py` circuit-breaker.
 - **File size:** modules **< ~500 lines**; split by responsibility (roadmap engineering convention).
 - **Monitoring:** `/healthz` `/readyz` (and a `/poolz` if pooled) **bind loopback-only** per the
@@ -902,6 +931,7 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
 | `DISC_EMBEDDING_PROVIDER/MODEL/DIMENSION/BASE_URL/API_KEY` | comment embeddings (CSAI-compatible) | ollama / nomic / 1024 |
 | `DISC_MAX_COMMENT_CHARS`, `DISC_MAX_RESULTS`, `DISC_DB_STATEMENT_TIMEOUT_MS` | guardrails | 10000 / 100 / 5000 |
 | `DISC_LIVE_ENABLED` / `DISC_LIVE_HEARTBEAT_S` / `DISC_LIVE_MAX_CONNS` | live comment sync (§10h): switch / heartbeat / socket cap | true / 30 / 500 |
+| `DISC_PRESENCE_ENABLED` / `DISC_PRESENCE_TTL_S` | co-viewing presence (§10h): switch / roster entry TTL | true / 45 |
 | `DISC_DIGEST_ENABLED` / `DISC_DIGEST_DEFAULT_CADENCE` | email digest master switch / default frequency for new users (§11) | true / `off` |
 | `DISC_DIGEST_BATCH_SIZE` / `DISC_DIGEST_SEND_NOW_RATELIMIT` | sender batch size / on-demand rate limit | 200 / 1 per 10 min |
 | `DISC_AI_SUMMARY_ENABLED` | allow opt-in AI digest summaries (CSAI chat provider) | false |
@@ -925,8 +955,8 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
    `document_activity` projection; SPA view, client/store; `ThreadPanel` in `PreviewView` with the
    collapsed / pinned-right / pinned-bottom layout modes (§10b); batch `POST /attention/flags` +
    file-browser row badges (§10e); comment permalink deep-linking (§10f) and the pure comment window
-   for un-previewable formats (§10g); real-time comment sync in the open panel (§10h,
-   `WS /files/{uid}/live` + Redis pub/sub fan-out).
+   for un-previewable formats (§10g); real-time comment sync + co-viewing presence + new-content CSS
+   flash in the open panel (§10h, `WS /files/{uid}/live` + Redis pub/sub fan-out).
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
    source type; resolving-version links.
 7. **M6 — email digest (Phase 3 delivery):** `digest_subscriptions`/`digest_deliveries`;
@@ -973,10 +1003,12 @@ reusing the same builder.
    `?thread=&comment=` reference so the preview opens scrolled+highlighted to the exact comment
    (re-checked at open); un-previewable formats render a full-window pure comment window at the same
    `/preview/:uid` route, so deep-links never break and upgrade if a rendition later appears.
-12. **Real-time comment sync (§10h):** the *one* bounded exception to non-real-time — while two users
-   have the same file's panel open, comments sync live (`WS /files/{uid}/live`, Redis pub/sub,
-   ACL-per-push, enhancement-only). Content only — still **no presence, no typing, no badges**; every
-   other surface stays async.
+12. **Real-time in the open panel (§10h):** the *two* bounded exceptions to non-real-time, both scoped
+   to an already-open shared panel — (a) **live comment sync** between users viewing the same file, with
+   a **CSS flash** highlighting each newly-arrived comment; (b) **local co-viewing presence** ("also
+   here" roster/count for that file). `WS /files/{uid}/live`, Redis pub/sub, ACL-checked,
+   enhancement-only. Still forbidden: **global presence, typing indicators, badges, per-event push**;
+   every other surface stays async.
 13. **Dashboard refresh (§10a):** the dashboard feeds and metrics refresh on a **~30 s focused poll**
    (configurable, paused when hidden) — current numbers without a push surface. Poll, not push; the
    live channel is the open panel only (§10h).
