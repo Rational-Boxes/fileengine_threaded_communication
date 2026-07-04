@@ -20,12 +20,16 @@ from . import __version__
 from .api import router
 from .bridge_auth import BridgeTokenVerifier
 from .config import Config
+from .permissions import Permissions
+from .store import ThreadStore
+from .threads_api import router as threads_router
 from .token_store import TokenStore
 
 log = logging.getLogger("discussion.app")
 
 
-def build_app(config: Config | None = None, *, token_store: TokenStore | None = None) -> FastAPI:
+def build_app(config: Config | None = None, *, token_store: TokenStore | None = None,
+              store: ThreadStore | None = None, permissions: Permissions | None = None) -> FastAPI:
     config = config or Config()
     app = FastAPI(title="discussion", version=__version__)
 
@@ -45,8 +49,13 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     app.state.token_store = token_store or TokenStore(ttl_seconds=config.token_ttl)
     app.state.bridge_verifier = BridgeTokenVerifier(
         config.bridge_url, config.bridge_introspect_ttl, jwt_secret=config.jwt_secret)
+    # Threads/comments (M1): a DB repository + a core-backed permission checker.
+    # Constructing them is cheap and side-effect free (no DB/gRPC until a call).
+    app.state.store = store or ThreadStore(config)
+    app.state.permissions = permissions or Permissions(config)
 
     app.include_router(router)
+    app.include_router(threads_router)
     return app
 
 

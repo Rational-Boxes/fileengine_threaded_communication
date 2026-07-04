@@ -8,9 +8,19 @@ Structurally a twin of `convert_search_ai` (CSAI) and `ldap_manager`.
 
 ## Status
 
-**M0 — skeleton** (see SPECIFICATION §15 milestones): FastAPI app, config, three-path
-auth (bridge bearer / service token / LDAP basic), per-tenant schema provisioning,
-`client_for`/`agent_client`, health/ready. M1–M6 follow on their own branches.
+Building milestone by milestone on stacked feature branches (see SPECIFICATION §15);
+nothing merges to `main` until the service is complete.
+
+- **M0 — skeleton** ✓ FastAPI app, config, three-path auth (bridge bearer / service
+  token / LDAP basic), per-tenant schema provisioning, `client_for`/`agent_client`,
+  health/ready.
+- **M1 — threads & comments** ✓ open/reply/resolve threads anchored to `file_uid`
+  (+ version); READ/WRITE gating via core `CheckPermission` as the end user;
+  own-comment edit (revision-versioned) / soft-delete; constrained-Markdown body
+  with a stripped `body_text` projection. `GET/POST /files/{uid}/threads`,
+  `GET/PATCH /threads/{id}`, `POST /threads/{id}/comments`, `PATCH/DELETE /comments/{id}`.
+- **M2–M6** — mentions/reviews/moderation, indexing/RAG, dashboard/preview/live,
+  MCP/provenance, email digest — follow.
 
 ## Layout
 
