@@ -1,9 +1,8 @@
-"""Threads & comments HTTP surface (M1) — hermetic.
+"""Threads, comments, mentions & moderation HTTP surface (M1 + M2) — hermetic.
 
-The DB repository and the core permission checker are replaced with in-memory
-fakes injected via build_app(), so these tests exercise the API + authorization
-logic without Postgres or the gRPC core. (SQL correctness is covered by a `live`
-test in a later milestone.)
+DB / core / LDAP / Redis are all replaced with in-memory fakes injected via
+build_app(), so these exercise the API + authorization + mention-safety + event
+emission without any live service.
 """
 import base64
 
@@ -18,8 +17,7 @@ from discussion.ldap_auth import Identity
 # ------------------------------- fakes -------------------------------------
 class FakeStore:
     def __init__(self):
-        self.threads: dict = {}
-        self.comments: dict = {}
+        self.threads, self.comments, self.mentions = {}, {}, []
         self._n = 0
 
     def _id(self, p):
@@ -30,7 +28,8 @@ class FakeStore:
         body = "" if (c["deleted"] or c["redacted"]) else c["body"]
         return {"id": c["id"], "thread_id": c["thread_id"], "author": c["author"], "body": body,
                 "created_at": c["created_at"], "edited_at": c["edited_at"], "deleted": c["deleted"],
-                "redacted": c["redacted"], "redacted_by": None, "redacted_reason": None}
+                "redacted": c["redacted"], "redacted_by": c.get("redacted_by"),
+                "redacted_reason": c.get("redacted_reason")}
 
     def create_thread(self, tenant, *, file_uid, version, title, body, body_text, opened_by):
         tid, cid = self._id("t"), self._id("c")
@@ -96,21 +95,88 @@ class FakeStore:
         c.update(deleted=True, body_text="")
         return True
 
+    def thread_participants(self, tenant, thread_id):
+        users = set()
+        t = self.threads.get(thread_id)
+        if t:
+            users.add(t["opened_by"])
+        for c in self.comments.values():
+            if c["thread_id"] == thread_id:
+                users.add(c["author"])
+        return list(users)
+
+    def add_mention(self, tenant, *, comment_id, thread_id, target_user):
+        self.mentions.append({"comment_id": comment_id, "thread_id": thread_id,
+                              "target_user": target_user})
+
+    def redact_comment(self, tenant, comment_id, *, redacted_by, reason):
+        c = self.comments.get(comment_id)
+        if c is None or c["redacted"]:
+            return None
+        c.update(redacted=True, redacted_by=redacted_by, redacted_reason=reason, body_text="")
+        return self.get_comment(tenant, comment_id)
+
 
 class FakePerms:
-    """reads/writes: True (all), None (none), or a set of allowed file_uids."""
-    def __init__(self, reads=True, writes=None):
-        self.reads, self.writes = reads, writes
+    """reads/writes: True (all), None (none), or a set of allowed file_uids.
+    deny_users: uids denied READ regardless (to exercise mention error-marking)."""
+    def __init__(self, reads=True, writes=None, deny_users=frozenset()):
+        self.reads, self.writes, self.deny_users = reads, writes, set(deny_users)
 
     @staticmethod
     def _ok(allow, file_uid):
         return True if allow is True else (False if not allow else file_uid in allow)
 
     def can_read(self, ident, file_uid):
+        if ident.user in self.deny_users:
+            return False
         return self._ok(self.reads, file_uid)
 
     def can_write(self, ident, file_uid):
         return self._ok(self.writes, file_uid)
+
+
+class FakeDirectory:
+    def __init__(self, mapping=None):
+        # identifier -> uid; unknown identifiers resolve to None.
+        self.mapping = mapping or {}
+
+    def resolve_principal(self, identifier):
+        uid = self.mapping.get(identifier)
+        return None if uid is None else Identity(user=uid, roles=["users"], tenant="default")
+
+
+class FakeNotes:
+    def __init__(self):
+        self.items = []
+
+    def add(self, tenant, *, user_id, kind, file_uid, actor, thread_id=None, review_id=None):
+        if not user_id or user_id == actor:
+            return
+        self.items.append({"user_id": user_id, "kind": kind, "file_uid": file_uid,
+                           "actor": actor, "thread_id": thread_id, "review_id": review_id})
+
+    def kinds_for(self, user_id):
+        return [i["kind"] for i in self.items if i["user_id"] == user_id]
+
+
+class FakeEvents:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, etype, **fields):
+        evt = {"type": etype, **fields}
+        self.published.append(evt)
+        return evt
+
+    def types(self):
+        return [e["type"] for e in self.published]
+
+
+class Ctx:
+    def __init__(self, client, store, notes, events, directory):
+        self.client, self.store, self.notes = client, store, notes
+        self.events, self.directory = events, directory
 
 
 # ------------------------------ fixtures -----------------------------------
@@ -129,116 +195,152 @@ def _auth(user):
 
 
 @pytest.fixture
-def make_client(monkeypatch):
+def make(monkeypatch):
     monkeypatch.setattr("discussion.api.authenticate", _fake_auth)
     monkeypatch.setattr("discussion.http_auth.authenticate", _fake_auth)
 
-    def _make(reads=True, writes=None):
-        store = FakeStore()
-        app = build_app(Config(), store=store, permissions=FakePerms(reads=reads, writes=writes))
-        return TestClient(app), store
+    def _make(reads=True, writes=None, deny_users=frozenset(), directory=None):
+        store, notes, events = FakeStore(), FakeNotes(), FakeEvents()
+        directory = directory or FakeDirectory()
+        app = build_app(Config(), store=store,
+                        permissions=FakePerms(reads=reads, writes=writes, deny_users=deny_users),
+                        directory=directory, events=events, notifications=notes,
+                        reviews=object())
+        return Ctx(TestClient(app), store, notes, events, directory)
     return _make
 
 
-# ------------------------------- tests -------------------------------------
-def test_open_thread_requires_read(make_client):
-    client, _ = make_client(reads=None)
-    r = client.post("/files/f1/threads", json={"body": "hi"}, headers=_auth("bob"))
-    assert r.status_code == 403
+# ------------------------------- M1 tests ----------------------------------
+def test_open_thread_requires_read(make):
+    c = make(reads=None)
+    assert c.client.post("/files/f1/threads", json={"body": "hi"},
+                         headers=_auth("bob")).status_code == 403
 
 
-def test_open_list_and_get_thread(make_client):
-    client, _ = make_client(reads=True)
-    r = client.post("/files/f1/threads", json={"title": "Q", "body": "**hi** there"},
-                    headers=_auth("bob"))
+def test_open_list_and_get_thread(make):
+    c = make(reads=True)
+    r = c.client.post("/files/f1/threads", json={"title": "Q", "body": "**hi** there"},
+                      headers=_auth("bob"))
     assert r.status_code == 201
     thread = r.json()
-    assert thread["file_uid"] == "f1" and thread["status"] == "open"
-    assert thread["opened_by"] == "bob"
+    assert thread["file_uid"] == "f1" and thread["opened_by"] == "bob"
     assert len(thread["comments"]) == 1 and thread["comments"][0]["body"] == "**hi** there"
+    assert "thread.opened" in c.events.types() and "comment.created" in c.events.types()
 
-    lst = client.get("/files/f1/threads", headers=_auth("carol"))
-    assert lst.status_code == 200 and len(lst.json()["threads"]) == 1
-
-    got = client.get(f"/threads/{thread['id']}", headers=_auth("carol"))
+    assert len(c.client.get("/files/f1/threads", headers=_auth("carol")).json()["threads"]) == 1
+    got = c.client.get(f"/threads/{thread['id']}", headers=_auth("carol"))
     assert got.status_code == 200 and len(got.json()["comments"]) == 1
 
 
-def test_get_thread_read_gated_and_404(make_client):
-    client, _ = make_client(reads=True)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    assert client.get("/threads/does-not-exist", headers=_auth("bob")).status_code == 404
-    # Now a client that can't read anything:
-    client2, store2 = make_client(reads=None)
-    store2.threads.update({"tX": {"id": "tX", "file_uid": "f9", "opened_by": "bob",
-                                  "status": "open", "version": "", "title": "", "resolved_by": None,
-                                  "resolved_version": None, "created_at": "t", "updated_at": "t",
-                                  "anchor_stale": False}})
-    assert client2.get("/threads/tX", headers=_auth("carol")).status_code == 403
+def test_get_thread_read_gated_and_404(make):
+    c = make(reads=None)
+    c.store.threads["tX"] = {"id": "tX", "file_uid": "f9", "opened_by": "bob", "status": "open",
+                             "version": "", "title": "", "resolved_by": None,
+                             "resolved_version": None, "created_at": "t", "updated_at": "t",
+                             "anchor_stale": False}
+    assert c.client.get("/threads/tX", headers=_auth("carol")).status_code == 403
+    assert c.client.get("/threads/nope", headers=_auth("carol")).status_code == 404
 
 
-def test_reply(make_client):
-    client, _ = make_client(reads=True)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    r = client.post(f"/threads/{tid}/comments", json={"body": "a reply"}, headers=_auth("carol"))
+def test_reply_and_participant_notification(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    r = c.client.post(f"/threads/{tid}/comments", json={"body": "a reply"}, headers=_auth("carol"))
     assert r.status_code == 201 and r.json()["author"] == "carol"
-    assert len(client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]) == 2
+    # bob (opener) gets a 'reply' notification; carol (actor) does not.
+    assert "reply" in c.notes.kinds_for("bob")
+    assert c.notes.kinds_for("carol") == []
 
 
-def test_resolve_by_opener_without_write(make_client):
-    client, _ = make_client(reads=True, writes=None)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    r = client.patch(f"/threads/{tid}", json={"status": "resolved", "resolved_version": "v2"},
-                     headers=_auth("bob"))
-    assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "resolved" and body["resolved_by"] == "bob"
-    assert body["resolved_version"] == "v2"
+def test_resolve_by_opener_notifies_and_emits(make):
+    c = make(reads=True, writes=None)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    c.client.post(f"/threads/{tid}/comments", json={"body": "r"}, headers=_auth("carol"))
+    r = c.client.patch(f"/threads/{tid}", json={"status": "resolved", "resolved_version": "v2"},
+                       headers=_auth("bob"))
+    assert r.status_code == 200 and r.json()["resolved_by"] == "bob"
+    assert "thread_resolved" in c.notes.kinds_for("carol")
+    assert "thread.resolved" in c.events.types()
 
 
-def test_resolve_forbidden_for_non_opener_without_write(make_client):
-    client, _ = make_client(reads=True, writes=None)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    r = client.patch(f"/threads/{tid}", json={"status": "resolved"}, headers=_auth("carol"))
-    assert r.status_code == 403
+def test_resolve_forbidden_for_non_opener_without_write(make):
+    c = make(reads=True, writes=None)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    assert c.client.patch(f"/threads/{tid}", json={"status": "resolved"},
+                          headers=_auth("carol")).status_code == 403
 
 
-def test_resolve_allowed_for_writer(make_client):
-    client, _ = make_client(reads=True, writes={"f1"})
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    r = client.patch(f"/threads/{tid}", json={"status": "resolved"}, headers=_auth("carol"))
+def test_resolve_allowed_for_writer(make):
+    c = make(reads=True, writes={"f1"})
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    r = c.client.patch(f"/threads/{tid}", json={"status": "resolved"}, headers=_auth("carol"))
     assert r.status_code == 200 and r.json()["resolved_by"] == "carol"
 
 
-def test_edit_own_comment_only(make_client):
-    client, store = make_client(reads=True)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    cid = client.post(f"/threads/{tid}/comments", json={"body": "orig"},
-                      headers=_auth("carol")).json()["id"]
-    # Author edits.
-    ok = client.patch(f"/comments/{cid}", json={"body": "edited"}, headers=_auth("carol"))
-    assert ok.status_code == 200 and ok.json()["body"] == "edited" and ok.json()["edited_at"]
-    # Someone else cannot.
-    assert client.patch(f"/comments/{cid}", json={"body": "hax"},
-                        headers=_auth("bob")).status_code == 403
+def test_edit_and_delete_own_comment(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    cid = c.client.post(f"/threads/{tid}/comments", json={"body": "orig"},
+                        headers=_auth("carol")).json()["id"]
+    assert c.client.patch(f"/comments/{cid}", json={"body": "edited"},
+                          headers=_auth("carol")).json()["body"] == "edited"
+    assert c.client.patch(f"/comments/{cid}", json={"body": "hax"},
+                          headers=_auth("bob")).status_code == 403
+    assert c.client.delete(f"/comments/{cid}", headers=_auth("bob")).status_code == 403
+    assert c.client.delete(f"/comments/{cid}", headers=_auth("carol")).json()["deleted"] is True
+    comments = c.client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]
+    assert [x for x in comments if x["id"] == cid][0]["body"] == ""
 
 
-def test_delete_own_comment_masks_body(make_client):
-    client, _ = make_client(reads=True)
-    tid = client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
-    cid = client.post(f"/threads/{tid}/comments", json={"body": "secret"},
-                      headers=_auth("carol")).json()["id"]
-    assert client.delete(f"/comments/{cid}", headers=_auth("bob")).status_code == 403
-    assert client.delete(f"/comments/{cid}", headers=_auth("carol")).json()["deleted"] is True
-    comments = client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]
-    deleted = [c for c in comments if c["id"] == cid][0]
-    assert deleted["deleted"] is True and deleted["body"] == ""
-
-
-def test_body_validation(make_client):
-    client, _ = make_client(reads=True)
-    assert client.post("/files/f1/threads", json={"body": "   "},
-                       headers=_auth("bob")).status_code == 422
+def test_body_validation(make):
+    c = make(reads=True)
+    assert c.client.post("/files/f1/threads", json={"body": "  "},
+                         headers=_auth("bob")).status_code == 422
     big = "x" * (Config().max_comment_chars + 1)
-    assert client.post("/files/f1/threads", json={"body": big},
-                       headers=_auth("bob")).status_code == 422
+    assert c.client.post("/files/f1/threads", json={"body": big},
+                         headers=_auth("bob")).status_code == 422
+
+
+# ------------------------------- M2 tests ----------------------------------
+def test_mention_valid_notifies_and_emits(make):
+    c = make(reads=True, directory=FakeDirectory({"carol@x": "carol"}))
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    r = c.client.post(f"/threads/{tid}/comments",
+                      json={"body": "ping", "mentions": ["carol@x"]}, headers=_auth("bob"))
+    assert r.status_code == 201
+    assert "mention" in c.notes.kinds_for("carol")
+    assert "mention.created" in c.events.types()
+    assert c.store.mentions and c.store.mentions[0]["target_user"] == "carol"
+
+
+def test_mention_invalid_is_error_marked(make):
+    # carol resolves but is denied READ; dave doesn't resolve at all -> both invalid.
+    c = make(reads=True, deny_users={"carol"},
+             directory=FakeDirectory({"carol@x": "carol"}))
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    r = c.client.post(f"/threads/{tid}/comments",
+                      json={"body": "ping", "mentions": ["carol@x", "dave@x"]}, headers=_auth("bob"))
+    assert r.status_code == 422
+    invalid = r.json()["detail"]["invalid_mentions"]
+    assert set(invalid) == {"carol@x", "dave@x"}
+    # No comment/mention was persisted (only the opening comment remains).
+    assert len(c.client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]) == 1
+    assert c.store.mentions == []
+
+
+def test_redaction_admin_only(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    cid = c.client.post(f"/threads/{tid}/comments", json={"body": "sensitive"},
+                        headers=_auth("carol")).json()["id"]
+    # Non-admin cannot redact.
+    assert c.client.post(f"/comments/{cid}/redact", json={"reason": "pii"},
+                         headers=_auth("bob")).status_code == 403
+    # Admin redacts -> masked.
+    r = c.client.post(f"/comments/{cid}/redact", json={"reason": "pii"}, headers=_auth("admin"))
+    assert r.status_code == 200 and r.json()["redacted"] is True and r.json()["body"] == ""
+    # Redacted body no longer visible in the thread.
+    shown = c.client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]
+    assert [x for x in shown if x["id"] == cid][0]["body"] == ""
+    # Second redact -> already redacted -> 404.
+    assert c.client.post(f"/comments/{cid}/redact", json={}, headers=_auth("admin")).status_code == 404

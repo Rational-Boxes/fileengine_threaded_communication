@@ -19,8 +19,13 @@ nothing merges to `main` until the service is complete.
   own-comment edit (revision-versioned) / soft-delete; constrained-Markdown body
   with a stripped `body_text` projection. `GET/POST /files/{uid}/threads`,
   `GET/PATCH /threads/{id}`, `POST /threads/{id}/comments`, `PATCH/DELETE /comments/{id}`.
-- **M2–M6** — mentions/reviews/moderation, indexing/RAG, dashboard/preview/live,
-  MCP/provenance, email digest — follow.
+- **M2 — mentions, reviews & moderation** ✓ `@mention` with address-anything-then-
+  validate-on-submit READ check (error-marked if a target lacks access, §5.1); review
+  state machine (`raise → acknowledge → complete`, reviewer-gated, requester notified);
+  admin redaction (`POST /comments/{id}/redact` — mask + de-index, original retained in
+  `redactions`, audited, §5b); `notifications` writes (mention/reply/review/resolution);
+  emits `discussion:events` to Redis (best-effort).
+- **M3–M6** — indexing/RAG, dashboard/preview/live, MCP/provenance, email digest — follow.
 
 ## Layout
 

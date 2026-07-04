@@ -167,3 +167,44 @@ class ThreadStore:
             changed = cur.rowcount
             conn.commit()
         return bool(changed)
+
+    # -- mentions / participants / moderation (M2) ---------------------------
+    def add_mention(self, tenant: str, *, comment_id: str, thread_id: str, target_user: str) -> None:
+        with self._conn(tenant) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mentions (comment_id, thread_id, target_user) VALUES (%s, %s, %s)",
+                (comment_id, thread_id, target_user))
+            conn.commit()
+
+    def thread_participants(self, tenant: str, thread_id: str) -> list[str]:
+        """Distinct users involved in a thread (opener + comment authors) — the
+        recipients of reply / resolution notifications."""
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT opened_by FROM threads WHERE id = %s "
+                "UNION SELECT author FROM comments WHERE thread_id = %s",
+                (thread_id, thread_id))
+            return [r[0] for r in cur.fetchall() if r[0]]
+
+    def redact_comment(self, tenant: str, comment_id: str, *, redacted_by: str,
+                       reason: str) -> Optional[dict]:
+        """Administrator redaction (§5b): move the original into ``redactions``
+        (retained forever), mask the display, and de-index (drop comment_chunks).
+        Returns the masked comment, or None if missing/already redacted."""
+        with self._conn(tenant) as conn, conn.cursor() as cur:
+            cur.execute("SELECT body, redacted FROM comments WHERE id = %s", (comment_id,))
+            row = cur.fetchone()
+            if row is None or row[1]:
+                return None
+            cur.execute(
+                "INSERT INTO redactions (comment_id, original_body, redacted_by, reason) "
+                "VALUES (%s, %s, %s, %s)",
+                (comment_id, row[0], redacted_by, reason))
+            cur.execute(
+                "UPDATE comments SET redacted = true, redacted_by = %s, redacted_at = now(), "
+                "redacted_reason = %s, body_text = '' WHERE id = %s",
+                (redacted_by, reason, comment_id))
+            # De-index so redacted content can't resurface via search/RAG (§6).
+            cur.execute("DELETE FROM comment_chunks WHERE comment_id = %s", (comment_id,))
+            conn.commit()
+        return self.get_comment(tenant, comment_id)
