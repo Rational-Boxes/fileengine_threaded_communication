@@ -229,6 +229,48 @@ CREATE TABLE comment_chunks (
     fts        tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED
 );
 CREATE INDEX idx_comment_chunks_hnsw ON comment_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Durable projection of core file events (§8) so both the dashboard activity feed (§10a) and the
+-- email digest (§11) can query "activity since T" and ACL-filter per viewer. Populated by the
+-- event consumer from file.created/updated/restored; ACL is re-checked at read time by file_uid.
+CREATE TABLE document_activity (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    file_uid   TEXT NOT NULL,
+    event_type TEXT NOT NULL,                        -- 'created' | 'updated' | 'restored'
+    version    TEXT NOT NULL DEFAULT '',
+    name       TEXT NOT NULL DEFAULT '',
+    path       TEXT NOT NULL DEFAULT '',
+    actor      TEXT NOT NULL DEFAULT '',
+    ts         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_activity_ts ON document_activity (ts DESC);
+CREATE INDEX idx_activity_file ON document_activity (file_uid);
+
+-- Per-user email-digest subscription (§11a). One row per user; self-service managed.
+CREATE TABLE digest_subscriptions (
+    user_id         TEXT PRIMARY KEY,
+    cadence         TEXT NOT NULL DEFAULT 'off'
+                    CHECK (cadence IN ('off','hourly','daily','weekly')),  -- user-chosen frequency
+    send_hour_local SMALLINT NOT NULL DEFAULT 8   CHECK (send_hour_local BETWEEN 0 AND 23),
+    send_dow        SMALLINT NOT NULL DEFAULT 1   CHECK (send_dow BETWEEN 0 AND 6),  -- weekly: 0=Sun
+    timezone        TEXT NOT NULL DEFAULT 'UTC',
+    scope           JSONB NOT NULL DEFAULT '{}',   -- {attention:true, activity:false, trees:[uid], tags:[..]}
+    ai_summary      BOOLEAN NOT NULL DEFAULT false,
+    quiet_if_empty  BOOLEAN NOT NULL DEFAULT true,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per (user, period) the sender processed — the idempotency guard (§11c). The UNIQUE key
+-- makes double-send impossible across overlapping cron ticks / re-runs.
+CREATE TABLE digest_deliveries (
+    user_id     TEXT NOT NULL,
+    period_key  TEXT NOT NULL,                       -- cadence bucket, e.g. 2026-07-04T15 | 2026-07-04 | 2026-W27
+    status      TEXT NOT NULL CHECK (status IN ('sent','skipped_empty','error')),
+    item_count  INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    sent_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, period_key)
+);
 ```
 
 **Anchoring notes (grounded in the core's real model):**
@@ -275,7 +317,7 @@ Markdown links.
   Markdown renderer feeding a strict **allowlist sanitizer**: only the tags/attributes for the
   features above survive; everything else (scripts, event handlers, unknown schemes) is dropped.
   Rendered HTML is **never stored** and never trusted from the client — untrusted Markdown → XSS is
-  the obvious risk, closed by sanitizing on the way out (see §12).
+  the obvious risk, closed by sanitizing on the way out (see §13).
 - `comments.body_text` — a **plaintext projection** (markup stripped) the service computes on
   write, used for FTS and embeddings so search matches on words, not backticks or asterisks
   (§6). Same treatment flows into `comment_chunks.text`.
@@ -306,7 +348,7 @@ requesting user** (`ManagedFiles(user_name=…, user_roles=…, tenant=…)`), i
 **Two ACL-safety invariants (the analogue of CSAI's retrieval-time gating):**
 
 1. **A mention/flag can never leak a document's existence.** The author may address *any* email —
-   there is no pre-filtered "eligible users" picker (that discovery feature is deferred, §15). Instead,
+   there is no pre-filtered "eligible users" picker (that discovery feature is deferred, §16). Instead,
    **on submit** the service checks each referenced target's READ on the anchor `file_uid` (core
    `CheckPermission` as that target). A target **without** READ is **rejected and error-marked**: the
    submit returns a per-reference validation error identifying which addressed users lack access, and
@@ -467,6 +509,11 @@ GET    /dashboard/attention                   # merged, ACL-filtered notificatio
 POST   /dashboard/attention/{id}/seen         # mark seen (state only; not a badge system)
 GET    /dashboard/activity                    # new/updated documents the caller may see (from core events, READ-filtered)
 
+# Email-digest self-service (§11a)
+GET    /me/digest                             # read the caller's digest subscription
+PUT    /me/digest                             # update {cadence, send_hour_local, send_dow, timezone, scope, ai_summary, quiet_if_empty}
+POST   /me/digest/send-now                    # on-demand digest for the caller (rate-limited, §11c)
+
 # Search within commentary
 GET    /search?q=…                            # FTS/fuzzy over comments the caller may read
 
@@ -495,8 +542,9 @@ the file browser remains a first-class destination reachable from the nav. Struc
    acknowledgments/completions of reviews you raised, resolutions. Each item deep-links to the anchor
    document's preview with the thread panel open.
 2. **Document-activity feed** — new and updated documents the user is privileged to see
-   (`GET /dashboard/activity`), sourced from the core event stream, READ-filtered. This is the
-   Phase 3 "calm awareness" projection rendered in-app (no badges, no interrupt).
+   (`GET /dashboard/activity`), served from the `document_activity` projection (§4, materialized from
+   core events), READ-filtered per viewer. This is the Phase 3 "calm awareness" projection rendered
+   in-app (no badges, no interrupt) — the same source the email digest (§11) draws from.
 
 Client/store to add (matching `csaiClient.ts` + `stores/auth.ts`):
 `src/services/discussionClient.ts` (axios, base `/discuss` via `VITE_DISCUSS_BASE`, attaches
@@ -523,7 +571,7 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
   not a heavyweight WYSIWYG/ProseMirror stack. The editor's value is the raw Markdown persisted to
   `comments.body`; the wire/storage format is always Markdown.
 - **Rendering** uses a shared `renderMarkdown()` util (markdown renderer → strict allowlist
-  sanitizer, §12) reused by both the editor preview and the read view, so authored and displayed
+  sanitizer, §13) reused by both the editor preview and the read view, so authored and displayed
   output can never diverge and unsanitized HTML never reaches the DOM. **The SPA already ships
   `marked` (renderer) and `dompurify` (sanitizer)** — reuse that exact pipeline (`marked` →
   `DOMPurify.sanitize` with the §4a allowlist), matching whatever already backs the chat/report
@@ -531,9 +579,120 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
 - Live character count against `DISC_MAX_COMMENT_CHARS`; paste is normalized to the allowed subset
   (e.g. pasted HTML is converted to Markdown or stripped, never injected raw).
 
+### 10d. Digest settings panel
+A self-service panel (in the dashboard, or Profile — mirroring `ldap_manager`'s `/me` self-service
+and `ProfileView`) bound to `GET/PUT /me/digest` (§9), where the user sets their **notification
+frequency** (`off` / `hourly` / `daily` / `weekly`), preferred time/day, scope (attention only, or
+also activity for chosen trees/tags), AI-summary opt-in, and quiet-if-empty. Includes a **"Send me a
+digest now"** button (`POST /me/digest/send-now`). This is the UI over the §11 email digest.
+
 ---
 
-## 11. Provenance integration (Phase 1 hook)
+## 11. Email digest — user-configurable, cron-driven
+
+This is the **email delivery half of the roadmap's Phase 3 digest** (the in-app attention/activity
+feeds in §10 are the pull half). It is the async-first awareness surface: a **calm, periodic email**
+whose **cadence the receiver chooses** — never a per-event notification. It directly inverts Slack's
+incentive misalignment: the sender pays nothing to interrupt; here, nobody is interrupted at all,
+because the receiver controls if and how often they hear from FileEngine.
+
+**Anti-goal alignment (§1):** the digest is *scheduled and receiver-controlled*, so it is **not**
+the "push notifications / real-time interrupt surface" the non-goals forbid. One email per period,
+opt-in, per the receiver's frequency. A bot posting "Alice updated Q3_Deck.pdf" the moment it happens
+is exactly what this design refuses to build.
+
+### 11a. User-configurable subscription
+
+Each user, per tenant, owns a digest subscription (`digest_subscriptions`, §4), managed through
+self-service settings (§9 `/me/digest`, §10 dashboard panel). Configurable:
+
+- **Frequency (`cadence`)** — the receiver's choice: **`off` · `hourly` · `daily` · `weekly`**. This
+  is the "notification frequency" control; `off` is always available (calm by default is a first-class
+  state, not a punishment).
+- **Preferred time** — `send_hour_local` (0–23) for `daily`/`weekly`; `send_dow` (0–6) for `weekly`;
+  interpreted in the user's `timezone`. (`hourly` ignores both.)
+- **Scope** — what the digest covers (`scope` JSON): the **attention** stream (mentions, replies,
+  review requests/acks/completions, resolutions — always on when enabled) and, optionally,
+  **document activity** for subscribed trees (`file_uid`s) and/or tags the user follows.
+- **AI summary** (`ai_summary`, opt-in) — a short natural-language rollup of the period
+  ("3 new versions of the structural drawings; the LEED submittal was promoted; 2 comments await your
+  reply"), generated best-effort via the CSAI chat provider.
+- **`quiet_if_empty`** (default true) — send nothing when there is nothing; an empty period simply
+  advances without an email. Calm by default.
+
+### 11b. Digest content (per recipient, ACL-filtered)
+
+Built from the durable **`notifications`** table (§4 — written as events occur) and the
+**`document_activity`** projection (§4 — materialized from consumed core events, §8), covering
+everything since the recipient's last delivered period. **Every item is re-checked with
+`can_read(file_uid)` at send time, evaluated *as that recipient*** — the digest never mentions a file
+the user can no longer see (the §5 golden rule and §5.1 invariant, applied to email). Links deep-link
+into the **authenticated SPA** (`/dashboard`, `/preview/{uid}`) — the email carries titles/snippets
+the recipient may already read, never privileged content, and never a bearer token.
+
+### 11c. The cron-triggered sender script
+
+A standalone, **short-lived batch entrypoint** — `discuss-digest` (console script) →
+`python -m discussion.digest` — **not** a long-running worker. It is **invoked hourly by cron** (or a
+systemd timer, §11d); each run self-selects the users who are *due this hour* and sends them one
+digest. The hourly tick is the clock; the **per-user `cadence` decides who actually receives one**:
+
+- `hourly` → due every run (if there is content);
+- `daily` → due on the run whose local hour == `send_hour_local`;
+- `weekly` → due when local `(dow, hour)` == `(send_dow, send_hour_local)`;
+- `off` → never.
+
+**Algorithm (one run):**
+1. **Take a run lock** (Postgres advisory lock, keyed per tenant/shard) so overlapping cron ticks or a
+   slow prior run can't double-send.
+2. For each tenant, select enabled subscriptions **due now** whose current period has **no
+   `digest_deliveries` row** (the idempotency guard — see below).
+3. For each due user, **acting as that user** (`client_for(identity)` with roles resolved from LDAP,
+   per the impersonation rule — never a service account that filters afterward):
+   a. Gather `notifications` + in-scope `document_activity` since `last period`, **ACL-filtered**
+      via `PermissionGate.can_read`.
+   b. If empty and `quiet_if_empty` → record a `skipped_empty` delivery and continue (advances the period).
+   c. Optionally generate the AI summary (best-effort; failure downgrades to no-summary, never aborts).
+   d. Render HTML + plaintext from a template (shared SMTP settings, the same `ldap_manager` uses for
+      invite/reset mail).
+   e. **Send via SMTP**, then **record a `digest_deliveries` row** `(user, tenant, period_key, sent_at,
+      item_count, status)`.
+4. **Release the lock.**
+
+**Idempotency & crash-safety:** the `UNIQUE (user_id, period_key)` constraint on `digest_deliveries`
+is the safety net — `period_key` is the canonical bucket for the user's cadence (e.g. `2026-07-04`
+for daily, `2026-07-04T15` for hourly, `2026-W27` for weekly). A row is written per period, so a
+re-run (crash, overlapping tick, manual re-invoke) **cannot double-send**; a crash mid-batch simply
+resumes with the not-yet-recorded users next tick. This mirrors the CSAI ingest crash-safety ethos.
+Email send + delivery-row write should be ordered so a send failure leaves the period **unmarked**
+(retried next hour) with a bounded `error` status/retry count to avoid infinite retry on a poison user.
+
+**On-demand** (`POST /me/digest/send-now`, §9) reuses the same builder for a single user, rate-limited,
+bypassing cadence — the roadmap's "daily / weekly / on-demand".
+
+### 11d. Scheduling & deployment
+
+- **Production:** the schedule is owned by the **discussion Ansible role** in the scripts repo
+  (`Rational-Boxes/fileengine_support_scripts`), consistent with the deploy convention — the
+  discussion image exposes app + `discuss-digest` commands (as CSAI exposes app + worker), and the
+  sender runs on an **hourly schedule** via a systemd timer / container cron shipped by that role.
+  Host systemd units remain reserved for host concerns; this is a service task, so it lives with the
+  service role.
+- **Dev:** an hourly `crontab` line or a systemd **user** timer, mirroring the `csai-ingest` local
+  convenience. Example:
+  ```
+  # crontab: hourly, on the hour
+  0 * * * *  cd /…/discussion_threaded_communication && PYTHONPATH=src /usr/bin/python3.14 -m discussion.digest >> /tmp/discuss_digest.log 2>&1
+  ```
+  The script exits after each run; the schedule — not the process — is the periodicity.
+
+**Config** (§14): `DISC_DIGEST_ENABLED`, `DISC_DIGEST_DEFAULT_CADENCE`, `DISC_DIGEST_BATCH_SIZE`,
+`DISC_DIGEST_SEND_NOW_RATELIMIT`, `DISC_SPA_BASE_URL` (deep-link base), `DISC_AI_SUMMARY_ENABLED`,
+plus SMTP (`DISC_SMTP_HOST/PORT/USER/PASSWORD`, `DISC_DIGEST_FROM`).
+
+---
+
+## 12. Provenance integration (Phase 1 hook)
 
 - On resolve, `threads.resolved_version` records the version that addressed the discussion — a
   backward-provenance link ("this revision closed that thread").
@@ -544,7 +703,7 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
 
 ---
 
-## 12. Non-functional requirements & conventions
+## 13. Non-functional requirements & conventions
 
 - **Bridge/impersonation rules (roadmap):** thin door, zero enforcement logic, every core call as the
   end user. No broad-query-then-filter as a service account.
@@ -556,6 +715,11 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
   trusted from the client. Enforce `DISC_MAX_COMMENT_CHARS` on the raw Markdown at write time (a
   guardrail like CSAI's `CSAI_MAX_*`).
 - **At-least-once events:** idempotent handlers; ack only after success; degraded sleep/poll on core read-only.
+- **Digest sender (§11c):** ACL-filter every item **as the recipient** at send time (fail-closed,
+  impersonation rule — never a service account that filters afterward); **idempotent per period**
+  (`UNIQUE (user_id, period_key)`); a **run lock** prevents overlapping cron ticks double-sending;
+  AI summary and SMTP are best-effort and must never abort the batch; a send failure leaves the
+  period unmarked for retry, bounded to avoid poison-user loops.
 - **DB failover:** master/replica with read-only degradation, reusing CSAI's `db.py` circuit-breaker.
 - **File size:** modules **< ~500 lines**; split by responsibility (roadmap engineering convention).
 - **Monitoring:** `/healthz` `/readyz` (and a `/poolz` if pooled) **bind loopback-only** per the
@@ -565,7 +729,7 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
 
 ---
 
-## 13. Configuration (env)
+## 14. Configuration (env)
 
 Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Service-specific:
 
@@ -582,10 +746,15 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
 | `DISC_EMITS_STREAM` | this service's event stream | `discussion:events` |
 | `DISC_EMBEDDING_PROVIDER/MODEL/DIMENSION/BASE_URL/API_KEY` | comment embeddings (CSAI-compatible) | ollama / nomic / 1024 |
 | `DISC_MAX_COMMENT_CHARS`, `DISC_MAX_RESULTS`, `DISC_DB_STATEMENT_TIMEOUT_MS` | guardrails | 10000 / 100 / 5000 |
+| `DISC_DIGEST_ENABLED` / `DISC_DIGEST_DEFAULT_CADENCE` | email digest master switch / default frequency for new users (§11) | true / `off` |
+| `DISC_DIGEST_BATCH_SIZE` / `DISC_DIGEST_SEND_NOW_RATELIMIT` | sender batch size / on-demand rate limit | 200 / 1 per 10 min |
+| `DISC_AI_SUMMARY_ENABLED` | allow opt-in AI digest summaries (CSAI chat provider) | false |
+| `DISC_SPA_BASE_URL` | base URL for authenticated deep links in emails | — |
+| `DISC_SMTP_HOST/PORT/USER/PASSWORD`, `DISC_DIGEST_FROM` | outbound mail (as `ldap_manager` invite/reset mail) | — |
 
 ---
 
-## 14. Milestones
+## 15. Milestones
 
 1. **M0 — skeleton:** FastAPI app, config, three-path auth, per-tenant schema provisioning,
    `client_for`/`agent_client`, health/ready. (Twin of CSAI bootstrap.)
@@ -596,17 +765,23 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
    `notifications` writes; emit `discussion:events`.
 4. **M3 — indexing & RAG:** `comment_chunks` embed/store; comment search; CSAI retrieval integration
    (Option A internal retrieve endpoint, §6).
-5. **M4 — dashboard:** `/dashboard/attention` + `/dashboard/activity`; SPA view, `ThreadPanel`,
-   client/store; core-event-fed activity feed.
+5. **M4 — dashboard:** `/dashboard/attention` + `/dashboard/activity`; `document_activity` projection;
+   SPA view, `ThreadPanel`, client/store.
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
    source type; resolving-version links.
+7. **M6 — email digest (Phase 3 delivery):** `digest_subscriptions`/`digest_deliveries`;
+   `/me/digest` self-service + settings panel (§10d); the hourly cron `discuss-digest` sender (§11c)
+   with per-recipient ACL filtering, per-period idempotency, run lock, SMTP templates, opt-in AI
+   summary; Ansible-role schedule (§11d).
 
-Order matches the roadmap sequencing (P2 feeds the promotion loop; digest transport is P3, so the
-dashboard's activity feed is the in-app half and the chat-delivered digest waits for P3/P5).
+Order matches the roadmap sequencing: M0–M5 land the Phase 2 substrate (threads, moderation, RAG,
+dashboard); **M6 is the Phase 3 email digest**, built on the M2 `notifications` + M4
+`document_activity` foundation. Chat-delivered digests (Slack/Teams/Matrix) remain later (P5/P6),
+reusing the same builder.
 
 ---
 
-## 15. Decisions & remaining scope
+## 16. Decisions & remaining scope
 
 **Resolved for v1:**
 1. **Landing route (§10a):** `/` redirects to `/dashboard`; the dashboard is the post-login landing
@@ -623,6 +798,10 @@ dashboard's activity feed is the in-app half and the chat-delivered digest waits
 6. **Comment editor (§10c):** a **lightweight** toolbar editor that serializes to Markdown (no
    heavyweight WYSIWYG); render via the SPA's existing `marked` + `dompurify`.
 7. **RAG/CSAI exposure (§6):** **Option A** — internal retrieve endpoint; each service owns its data.
+8. **Email digest (§11):** **user-chosen frequency** (`off`/`hourly`/`daily`/`weekly`), delivered by
+   an **hourly cron** `discuss-digest` sender that self-selects due users; per-recipient ACL filtering,
+   per-period idempotency, opt-in AI summary, quiet-if-empty. Email + in-app only — **no per-event
+   push** (Phase 3 delivery; the Phase 2 substrate is a prerequisite).
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
