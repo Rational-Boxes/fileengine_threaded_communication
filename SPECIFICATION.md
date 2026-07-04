@@ -23,8 +23,7 @@ anchor document** — the service invents no access model of its own.
 ## 1. Scope & non-goals
 
 ### In scope
-- Threaded comments anchored to a **file**, a specific **version**, or a **region** of a file
-  (page/range; for BIM, an IFC element GUID).
+- Threaded comments anchored to a **file** or a specific **version** of a file.
 - Thread lifecycle: `open → resolved`, with the resolving document version recorded (provenance).
 - **@mention / flag**: raise a comment to a specific user's attention.
 - **Review requests**: a requester asks one or more reviewers to review an anchor; acknowledgment
@@ -44,13 +43,24 @@ even behind a flag:
 - The dashboard is a *projection of permissioned data the core already emits* — never a
   second, parallel messaging system.
 
+### Deferred to a V2 specification
+**Association of comments to entities *inside* a document — especially 3D model elements — is
+out of scope for v1 and will be its own V2 specification.** This covers pinning a thread to a
+sub-document region: an IFC/BIM element GUID, a PDF page + rectangle, a point-cloud/LAS bounding
+box, a drawing coordinate, etc. It is deferred deliberately — it needs per-viewer coordinate models
+and interaction design (xeokit picking, PDF overlays) that warrant separate treatment, and the core
+has no sub-document addressing to build on (§4). **v1 anchors a thread to `(file_uid, version?)`
+only.** The v1 data model and API are designed to extend to region anchoring additively (a future
+`region` field on the anchor) so V2 layers on without migration pain — but v1 neither stores nor
+interprets any in-document coordinate.
+
 ---
 
 ## 2. Glossary
 
 | Term | Meaning |
 |------|---------|
-| **Anchor** | The `(file_uid, version?, region?)` a thread is pinned to. `file_uid` is required. |
+| **Anchor** | The `(file_uid, version?)` a thread is pinned to. `file_uid` is required. (In-document region anchoring is deferred to V2.) |
 | **Thread** | An ordered set of comments on one anchor, with an `open`/`resolved` lifecycle. |
 | **Comment** | One authored message in a thread. Immutable content; edits are versioned & audited. |
 | **Mention / flag** | A comment field targeting a user, raising the comment to their attention. |
@@ -117,7 +127,8 @@ CREATE TABLE threads (
     id            TEXT PRIMARY KEY,               -- app-generated id
     file_uid      TEXT NOT NULL,                  -- anchor; the core node whose ACL governs this thread
     version       TEXT NOT NULL DEFAULT '',       -- optional core version_timestamp; '' = "current"
-    region        JSONB,                          -- optional {page,range,ifc_guid,bbox}; opaque to the core
+    -- NOTE: in-document region anchoring (IFC element GUID, PDF page/rect, LAS bbox) is deferred
+    -- to the V2 spec; it will add a nullable `region JSONB` column here without further migration.
     title         TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
     resolved_by   TEXT,                           -- user who resolved
@@ -133,11 +144,12 @@ CREATE TABLE comments (
     id            TEXT PRIMARY KEY,
     thread_id     TEXT NOT NULL REFERENCES threads (id) ON DELETE CASCADE,
     author        TEXT NOT NULL,
-    body          TEXT NOT NULL,
+    body          TEXT NOT NULL,                  -- Markdown, constrained subset (see §4a)
+    body_text     TEXT NOT NULL DEFAULT '',       -- plaintext projection (markup stripped) for FTS + embeddings
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     edited_at     TIMESTAMPTZ,                    -- edits allowed only by the author; original kept in comment_revisions
     deleted       BOOLEAN NOT NULL DEFAULT false, -- soft-delete; body tombstoned, audit retained
-    fts           tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body,''))) STORED
+    fts           tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
 CREATE INDEX idx_comments_thread ON comments (thread_id, created_at);
 CREATE INDEX idx_comments_fts ON comments USING gin (fts);
@@ -207,12 +219,54 @@ CREATE INDEX idx_comment_chunks_hnsw ON comment_chunks USING hnsw (embedding vec
 **Anchoring notes (grounded in the core's real model):**
 - `file_uid` + `version` are the only identifiers the core understands. `version` is a
   lexicographically-sortable timestamp string from `ListVersions`.
-- **The core has no sub-region model.** `region` (page, range, `ifc_guid`, `bbox`) is *service-side
-  metadata*, interpreted by the frontend viewers (PDF preview, xeokit BIM viewer). This is expected —
-  IFC element-pinned annotation is a known AEC pain point the core intentionally leaves to this layer.
+- **The core has no sub-document model.** It addresses content by `file_uid` + `version` only —
+  there is no page, range, or IFC-element addressing to build on. In-document/entity anchoring is
+  therefore a genuine new capability, deferred to the **V2 specification** (see §1). When it lands,
+  the region will be *service-side metadata* interpreted by the frontend viewers (PDF preview,
+  xeokit BIM viewer) — the core stays unaware. v1 stores no such coordinate.
 - A thread may pin to a specific `version` (immutable, stays put) or track "current". On a
   `file.updated` core event, threads on the *previous current* version get `anchor_stale = true`
   so the UI can show "commented on an earlier revision".
+
+### 4a. Comment content format — constrained Markdown
+
+Comments support **basic rich-text formatting**, stored as a **constrained Markdown subset** — not
+HTML, not a proprietary rich-text blob. Markdown is the right substrate here: it is human-readable
+as raw text (greppable, diff-able in `comment_revisions`, portable through every door), and CSAI
+already treats extracted content as Markdown — so commentary indexes and renders on the exact same
+footing as document text.
+
+**Allowed formatting (the `etc.` made explicit):**
+
+| Feature | Markdown | Notes |
+|---------|----------|-------|
+| Bold / italic | `**bold**`, `*italic*` | |
+| Inline code | `` `code` `` | |
+| Code block | ` ```lang … ``` ` | fenced; optional language hint for highlighting |
+| Bulleted / numbered list | `- item` / `1. item` | nesting allowed |
+| Blockquote | `> quote` | |
+| Link | `[text](url)` | rendered `rel="noopener noreferrer"`, external `http(s)` only |
+| Line breaks / paragraphs | blank line | |
+
+**Deliberately excluded (v1):** raw/inline HTML, images & embeds, tables, headings (a comment is
+not a document — heading levels belong to canon, not chatter), and arbitrary URL schemes
+(`javascript:`, `data:` are stripped). `@mentions` are their own field/syntax (§5.1), not free
+Markdown links.
+
+**Three representations, one source of truth:**
+- `comments.body` — the **raw Markdown** the author typed. The canonical stored form; the only thing
+  the editor round-trips and `comment_revisions` versions.
+- **Rendered HTML** — produced **at render time** (server- or client-side) from `body` through a
+  Markdown renderer feeding a strict **allowlist sanitizer**: only the tags/attributes for the
+  features above survive; everything else (scripts, event handlers, unknown schemes) is dropped.
+  Rendered HTML is **never stored** and never trusted from the client — untrusted Markdown → XSS is
+  the obvious risk, closed by sanitizing on the way out (see §12).
+- `comments.body_text` — a **plaintext projection** (markup stripped) the service computes on
+  write, used for FTS and embeddings so search matches on words, not backticks or asterisks
+  (§6). Same treatment flows into `comment_chunks.text`.
+
+The same constrained-Markdown contract applies to a **thread's opening body** and a **review
+request's message**; all authored prose in this service shares one format and one sanitizer.
 
 ---
 
@@ -261,27 +315,31 @@ afterward.
 Roadmap requirement: "commentary becomes indexed content that can come up in search and exposed to
 the chat vector database … retrievable by the RAG pipeline as context for future questions."
 
-**Mechanism:** on comment create/edit/delete, the service chunks + embeds the body (pluggable
-provider, CSAI `providers/embeddings.py` pattern) into `comment_chunks`, **tagged with the anchor
+**Mechanism:** on comment create/edit/delete, the service chunks + embeds the **plaintext
+projection** (`body_text`, Markdown markup stripped — §4a), not the raw Markdown, so search and
+embeddings match on words rather than formatting characters. Uses the pluggable embedding provider
+(CSAI `providers/embeddings.py` pattern) into `comment_chunks`, **tagged with the anchor
 `file_uid`**. Because a comment inherits its anchor's ACL, keying chunks by `file_uid` means the
 *existing* `can_read(file_uid)` gate is exactly the right filter — **no new permission logic** is
 needed at retrieval.
 
-**Exposure to CSAI chat — integration decision (OPEN, recommend A):**
+**Exposure to CSAI chat — DECISION: Option A (each service owns its data).**
 
-- **Option A (recommended — low coupling):** the discussion service owns `comment_chunks` and
-  exposes an internal, agent-authenticated `POST /internal/retrieve` returning candidate
-  `(text, file_uid, thread_id, score)`. CSAI's `Retriever` calls it as an *additional source* and
-  runs each hit through its existing `PermissionGate.can_read`. Each service owns its data; ACL
-  enforcement stays at CSAI's retrieval boundary, which already gates by `file_uid`.
-- **Option B (cheaper to ship — tighter coupling):** the discussion service writes comment chunks
-  directly into CSAI's tenant `chunks` table with a `source='comment'` column and `file_uid` =
-  anchor. Zero CSAI retrieval changes (it already gates by `file_uid`), but it cross-writes another
-  service's schema.
+The discussion service owns `comment_chunks` and exposes an internal, agent-authenticated
+`POST /internal/retrieve` returning candidate `(text, file_uid, thread_id, score)`. CSAI's
+`Retriever` calls it as an *additional source* alongside its own `chunks` and runs each hit through
+its existing `PermissionGate.can_read`, then merges/ranks. Each service owns and migrates its own
+schema; the trust boundary stays clean (ACL enforcement remains at CSAI's retrieval boundary, which
+already gates by `file_uid`); and the discussion service can evolve its comment indexing without
+CSAI schema coupling.
 
-Recommendation: ship **B** as an interim if CSAI work must be minimized, migrate to **A** once the
-interface is proven (rule-of-three / roadmap DRY checkpoint). Either way, **retrieval ACL-gating is
-by anchor `file_uid` and unchanged.**
+*Rejected alternative (Option B):* have the discussion service write comment chunks directly into
+CSAI's tenant `chunks` table (`source='comment'`, `file_uid` = anchor). It needs zero CSAI retrieval
+changes, but it makes one service write another's schema — a coupling that violates the
+service-ownership boundary the rest of this design holds to. Not worth the short-term saving.
+
+Either way **retrieval ACL-gating is by anchor `file_uid` and unchanged** — Option A simply keeps
+that gate, and the data, on the right side of each service line.
 
 Full-text/fuzzy comment search (`pg_trgm` + `tsvector`, CSAI `search.py` pattern) is served from
 `comment_chunks`/`comments` directly by this service for the dashboard's in-thread search.
@@ -346,7 +404,7 @@ GET    /whoami
 
 # Threads on a document
 GET    /files/{file_uid}/threads              # ?version= ?status=open|resolved ; READ-gated
-POST   /files/{file_uid}/threads              # open a thread {version?, region?, title, body}
+POST   /files/{file_uid}/threads              # open a thread {version?, title, body}  (region: V2)
 GET    /threads/{id}                          # thread + comments (re-checks READ)
 POST   /threads/{id}/comments                 # reply {body, mentions:[user]}  (validates each mention: §5.1)
 PATCH  /threads/{id}                          # resolve/reopen {status, resolved_version?}
@@ -383,7 +441,7 @@ Two surfaces, both mirroring existing SPA conventions (service client + Pinia st
 
 ### 10a. The dashboard (landing surface)
 A new authed view — proposed route **`/dashboard`** (`requiresAuth`), and the **post-login
-landing** (change `/` redirect from `/files` → `/dashboard`; *open decision* in §14). Structurally
+landing** (change `/` redirect from `/files` → `/dashboard`; *open decision* in §15). Structurally
 like `ChatView`/`TenantAdminView` (two-pane / tabbed). Two feeds, per the original stub:
 
 1. **Attention feed** — messages/threads/reviews requesting the user's attention
@@ -402,9 +460,29 @@ websocket-push badge**).
 
 ### 10b. Inline thread panel
 A `ThreadPanel.vue` component embedded in `PreviewView` and the `FileDetailsDrawer`, showing/adding
-threads for the open document — and, for BIM, pinned to xeokit element GUIDs / PDF page-regions via
-the `region` field. This is where most commenting actually happens (on the document), the dashboard
-being the aggregation surface.
+threads for the open document (anchored to the file/version). This is where most commenting actually
+happens (on the document), the dashboard being the aggregation surface. *Pinning a thread to a
+specific in-document entity (xeokit BIM element, PDF page-region) is deferred to V2 (§1); v1 anchors
+at the document/version level.*
+
+### 10c. Comment editor
+A `CommentEditor.vue` component (used by `ThreadPanel`, the new-thread form, and the review-request
+message) providing **basic rich-text formatting** over the constrained-Markdown contract (§4a):
+
+- **Toolbar** with bold, italic, inline code, code block, bulleted list, numbered list, blockquote,
+  and link — plus their standard keyboard shortcuts (⌘/Ctrl-B, -I, etc.). The visible controls are
+  exactly the §4a allowlist; nothing that would produce disallowed markup is offered.
+- **Markdown in, Markdown out.** The editor's value is the raw Markdown persisted to `comments.body`
+  — whether implemented as a WYSIWYG surface that serializes to Markdown or a textarea with a
+  format toolbar is an implementation choice (§15), but the wire/storage format is always Markdown.
+- **Rendering** uses a shared `renderMarkdown()` util (markdown renderer → strict allowlist
+  sanitizer, §12) reused by both the editor preview and the read view, so authored and displayed
+  output can never diverge and unsanitized HTML never reaches the DOM. **The SPA already ships
+  `marked` (renderer) and `dompurify` (sanitizer)** — reuse that exact pipeline (`marked` →
+  `DOMPurify.sanitize` with the §4a allowlist), matching whatever already backs the chat/report
+  views, rather than adding a new dependency.
+- Live character count against `DISC_MAX_COMMENT_CHARS`; paste is normalized to the allowed subset
+  (e.g. pasted HTML is converted to Markdown or stripped, never injected raw).
 
 ---
 
@@ -425,6 +503,11 @@ being the aggregation surface.
   end user. No broad-query-then-filter as a service account.
 - **Tenant isolation:** per-tenant Postgres schema; `X-Tenant` scopes every request; caches keyed by tenant.
 - **Fail-closed permissions:** a core check that errors denies (CSAI `PermissionGate` convention).
+- **Comment sanitization (§4a):** authored Markdown is rendered through a strict allowlist sanitizer
+  (`marked` → `DOMPurify`, the SPA's existing pipeline) on every render path; raw HTML, scripts,
+  event handlers, and non-`http(s)` URL schemes are dropped. Rendered HTML is never stored or
+  trusted from the client. Enforce `DISC_MAX_COMMENT_CHARS` on the raw Markdown at write time (a
+  guardrail like CSAI's `CSAI_MAX_*`).
 - **At-least-once events:** idempotent handlers; ack only after success; degraded sleep/poll on core read-only.
 - **DB failover:** master/replica with read-only degradation, reusing CSAI's `db.py` circuit-breaker.
 - **File size:** modules **< ~500 lines**; split by responsibility (roadmap engineering convention).
@@ -477,20 +560,27 @@ dashboard's activity feed is the in-app half and the chat-delivered digest waits
 
 ## 15. Open questions
 
-1. **RAG coupling (§6):** ship Option A (internal retrieve endpoint) or B (cross-write CSAI's
-   `chunks`) first? Recommendation: B interim → A once the interface stabilizes.
-2. **Landing route (§10a):** does `/` become `/dashboard`, or does the dashboard live alongside
+1. **Landing route (§10a):** does `/` become `/dashboard`, or does the dashboard live alongside
    `/files` and the user chooses a default? Affects `router/index.ts`.
-3. **Comment-permission altitude (§5):** confirm "READ can comment" (PR-review semantics) vs a
+2. **Comment-permission altitude (§5):** confirm "READ can comment" (PR-review semantics) vs a
    stricter "WRITE to comment" for some tenants. Likely a per-tenant policy toggle — but v1 picks
    one default (proposed: READ).
-4. **Resolution authority:** is WRITE-on-file sufficient to resolve *any* thread, or only the opener/
+3. **Resolution authority:** is WRITE-on-file sufficient to resolve *any* thread, or only the opener/
    reviewer? (Spec currently allows WRITE — revisit with QMS/compliance needs.)
-5. **Mention target discovery:** the picker must only surface users who have READ on the anchor —
+4. **Mention target discovery:** the picker must only surface users who have READ on the anchor —
    does `ldap_manager`/core expose an efficient "who-can-read(file_uid)" query, or do we check
    per-candidate at submit time (safe but chatty)?
-6. **Region schema (§4):** finalize the `region` JSON shape per viewer (PDF page/rect, IFC GUID,
-   point-cloud/LAS bbox) — coordinate with the frontend viewer components.
-7. **Retention/moderation:** comments are append-only canon; what is the tenant-admin story for
+5. **V2 — in-document entity anchoring (§1):** the deferred region-anchoring capability (IFC/BIM
+   element GUID, PDF page/rect, point-cloud/LAS bbox, drawing coordinate) is its own **V2
+   specification**, covering per-viewer coordinate models and picking/overlay interaction. Not a v1
+   open question — tracked here only so the v1 anchor stays additively extensible toward it.
+6. **Retention/moderation:** comments are append-only canon; what is the tenant-admin story for
    redaction/legal-hold, given "no editing others' comments"?
+7. **Editor implementation (§10c):** WYSIWYG-that-serializes-to-Markdown (e.g. Tiptap/Milkdown/
+   ProseMirror) vs a lightweight textarea + format-toolbar + preview? Prefer reusing whatever
+   Markdown renderer/sanitizer already backs the chat/report views before adding a dependency. The
+   storage contract (constrained Markdown, §4a) is fixed regardless of the choice.
+
+**Resolved:** RAG/CSAI integration is **Option A** (internal retrieve endpoint; each service owns its
+data) — see §6.
 ```
