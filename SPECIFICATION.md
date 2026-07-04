@@ -739,6 +739,15 @@ Scoped so neither becomes the interrupt machine the project refuses to build:
   a *mask*, never re-broadcasting the original. The presence roster likewise only lists users who hold
   READ on the file (guaranteed — they have the panel open) and shows only their display identity, no
   location or activity beyond "here".
+- **Invisible viewing (administrators only).** A **tenant administrator** may open a file's comments
+  **without joining the presence roster** — an opt-in "view invisibly" toggle in the panel. Their
+  socket still receives live comments and still *sees* others' presence, but does **not** register in
+  `discussion:viewers:<tenant>:<file_uid>`, so peers never see them. The **server verifies
+  administrator status** (`require_tenant_admin`, per `ldap_manager`) before honouring it — a
+  non-admin's invisible request is ignored and they appear normally, so ordinary users can never lurk
+  unseen. Invisible to peers is **not** invisible to governance: the view is still recorded in the
+  server-side **audit log**, consistent with the redaction ethos (§5b) — hidden from colleagues, never
+  from the audit trail. (Gated by `DISC_PRESENCE_ADMIN_INVISIBLE`.)
 - **New content flashes in.** A comment or thread that arrives live is briefly **highlighted with a
   CSS flash/fade** as it appears (a background pulse settling to normal over ~1–2 s), so the eye is
   drawn to exactly what changed rather than hunting the thread. This reuses the same highlight
@@ -932,6 +941,7 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
 | `DISC_MAX_COMMENT_CHARS`, `DISC_MAX_RESULTS`, `DISC_DB_STATEMENT_TIMEOUT_MS` | guardrails | 10000 / 100 / 5000 |
 | `DISC_LIVE_ENABLED` / `DISC_LIVE_HEARTBEAT_S` / `DISC_LIVE_MAX_CONNS` | live comment sync (§10h): switch / heartbeat / socket cap | true / 30 / 500 |
 | `DISC_PRESENCE_ENABLED` / `DISC_PRESENCE_TTL_S` | co-viewing presence (§10h): switch / roster entry TTL | true / 45 |
+| `DISC_PRESENCE_ADMIN_INVISIBLE` | allow tenant admins to view without joining the roster (§10h; still audited) | true |
 | `DISC_DIGEST_ENABLED` / `DISC_DIGEST_DEFAULT_CADENCE` | email digest master switch / default frequency for new users (§11) | true / `off` |
 | `DISC_DIGEST_BATCH_SIZE` / `DISC_DIGEST_SEND_NOW_RATELIMIT` | sender batch size / on-demand rate limit | 200 / 1 per 10 min |
 | `DISC_AI_SUMMARY_ENABLED` | allow opt-in AI digest summaries (CSAI chat provider) | false |
@@ -1008,7 +1018,8 @@ reusing the same builder.
    a **CSS flash** highlighting each newly-arrived comment; (b) **local co-viewing presence** ("also
    here" roster/count for that file). `WS /files/{uid}/live`, Redis pub/sub, ACL-checked,
    enhancement-only. Still forbidden: **global presence, typing indicators, badges, per-event push**;
-   every other surface stays async.
+   every other surface stays async. **Tenant admins may view invisibly** (not in the roster,
+   server-verified, still audited — §10h).
 13. **Dashboard refresh (§10a):** the dashboard feeds and metrics refresh on a **~30 s focused poll**
    (configurable, paused when hidden) — current numbers without a push surface. Poll, not push; the
    live channel is the open panel only (§10h).
