@@ -542,8 +542,9 @@ the file browser remains a first-class destination reachable from the nav. Struc
 
 1. **Attention feed** — messages/threads/reviews requesting the user's attention
    (`GET /dashboard/attention`): mentions, replies to your threads, review requests assigned to you,
-   acknowledgments/completions of reviews you raised, resolutions. Each item deep-links to the anchor
-   document's preview with the thread panel open.
+   acknowledgments/completions of reviews you raised, resolutions. Each item **deep-links to the
+   referenced comment** (§10f) — opening the preview (or the pure comment window, §10g) scrolled and
+   highlighted to that comment, panel expanded.
 2. **Document-activity feed** — new and updated documents the user is privileged to see
    (`GET /dashboard/activity`), served from the `document_activity` projection (§4, materialized from
    core events), READ-filtered per viewer. This is the Phase 3 "calm awareness" projection rendered
@@ -653,6 +654,46 @@ the browser's existing row affordances; folders may roll up a subtree total (opt
   as the underlying items resolve. This is the **same source** as the dashboard feed, preview flag,
   and digest (§10a) — the file-list is simply a fourth rendering of it.
 
+### 10f. Deep-linking to a comment
+Every attention surface links to a *specific* comment, not just a document. The canonical link — the
+**thread/comment permalink** — carries the reference in the preview route:
+
+```
+/preview/:uid?thread=<thread_id>&comment=<comment_id>[&tenant=<tenant>]
+```
+
+Opening it: resolves the anchor, opens the preview (or the pure comment window, §10g, when the format
+can't be previewed), **force-expands** the `ThreadPanel` (overriding the collapsed default),
+**scrolls the target thread into view and briefly highlights** the referenced comment, and marks the
+originating notification seen. `comment` alone is sufficient — its thread is resolved server-side; a
+bare `thread` opens the thread at its top.
+
+- **One link shape everywhere.** Dashboard attention items (§10a), file-list badge clicks (§10e), the
+  collapsed preview flag (§10b-i), email-digest links (§11), mention/review notifications, and MCP
+  responses all use this permalink — it is also the "thread permalink" the provenance schema stores
+  (§12).
+- **Permission at open time.** The link carries only uids, never content or a token. On open the view
+  re-checks READ **as the viewer**; if denied (e.g. a link forwarded to someone without access), it
+  shows an access-denied state with a request-access affordance — never the comment. Mirrors the
+  roadmap's click-time link semantics.
+- **Base URL.** Emails/agents build absolute links from `DISC_SPA_BASE_URL` (§14).
+
+### 10g. Pure comment window (un-previewable formats)
+Many file types have **no preview renderer** (proprietary CAD/binary formats with no rendition, etc.).
+Discussion must still work, so for these the preview route renders a **pure comment window**: a
+full-stage `ThreadPanel` with a document header (name, version, download, attention flag) but **no
+document surface**.
+
+- **Same entry point, graceful degrade.** `/preview/:uid` stays the single destination and permalink
+  target; the view picks *document + panel* (§10b layout modes) when a renderer/rendition exists, or
+  the *pure comment window* when it doesn't. Deep-links (§10f) therefore never break, and a file that
+  later gains a rendition upgrades to the full preview automatically with no link rot. (A `/discuss/:uid`
+  alias may route here explicitly.)
+- The §10b layout modes don't apply here (there's nothing to reflow around) — the panel simply owns
+  the window. Comment deep-linking, flags, and digest links behave identically.
+
+---
+
 ## 11. Email digest — user-configurable, cron-driven
 
 This is the **email delivery half of the roadmap's Phase 3 digest** (the in-app attention/activity
@@ -691,9 +732,11 @@ Built from the durable **`notifications`** table (§4 — written as events occu
 **`document_activity`** projection (§4 — materialized from consumed core events, §8), covering
 everything since the recipient's last delivered period. **Every item is re-checked with
 `can_read(file_uid)` at send time, evaluated *as that recipient*** — the digest never mentions a file
-the user can no longer see (the §5 golden rule and §5.1 invariant, applied to email). Links deep-link
-into the **authenticated SPA** (`/dashboard`, `/preview/{uid}`) — the email carries titles/snippets
-the recipient may already read, never privileged content, and never a bearer token.
+the user can no longer see (the §5 golden rule and §5.1 invariant, applied to email). Links are
+**comment permalinks** (§10f) into the **authenticated SPA** — opening the referenced comment in the
+preview or pure comment window (§10g), re-checked at click time — built absolute from
+`DISC_SPA_BASE_URL`. The email carries titles/snippets the recipient may already read, never
+privileged content, and never a bearer token.
 
 ### 11c. The cron-triggered sender script
 
@@ -833,7 +876,8 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
 5. **M4 — dashboard, preview panel & file-list flags:** `/dashboard/attention` + `/dashboard/activity`;
    `document_activity` projection; SPA view, client/store; `ThreadPanel` in `PreviewView` with the
    collapsed / pinned-right / pinned-bottom layout modes (§10b); batch `POST /attention/flags` +
-   file-browser row badges (§10e).
+   file-browser row badges (§10e); comment permalink deep-linking (§10f) and the pure comment window
+   for un-previewable formats (§10g).
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
    source type; resolving-version links.
 7. **M6 — email digest (Phase 3 delivery):** `digest_subscriptions`/`digest_deliveries`;
@@ -876,6 +920,10 @@ reusing the same builder.
 10. **File-list attention flags (§10e):** the file browser shows per-row **flagged** (@mention) /
    **needs-review** badges for the caller, fetched for a whole directory in one batch call
    (`POST /attention/flags`). Fourth rendering of the one shared attention source (§10a).
+11. **Comment permalinks & pure comment window (§10f/§10g):** links carry a
+   `?thread=&comment=` reference so the preview opens scrolled+highlighted to the exact comment
+   (re-checked at open); un-previewable formats render a full-window pure comment window at the same
+   `/preview/:uid` route, so deep-links never break and upgrade if a rendition later appears.
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
