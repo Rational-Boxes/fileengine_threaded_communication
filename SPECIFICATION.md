@@ -148,7 +148,11 @@ CREATE TABLE comments (
     body_text     TEXT NOT NULL DEFAULT '',       -- plaintext projection (markup stripped) for FTS + embeddings
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     edited_at     TIMESTAMPTZ,                    -- edits allowed only by the author; original kept in comment_revisions
-    deleted       BOOLEAN NOT NULL DEFAULT false, -- soft-delete; body tombstoned, audit retained
+    deleted       BOOLEAN NOT NULL DEFAULT false, -- author soft-delete; body tombstoned, audit retained
+    redacted      BOOLEAN NOT NULL DEFAULT false, -- admin moderation (§5b): display masked, original moved to redactions
+    redacted_by   TEXT,
+    redacted_at   TIMESTAMPTZ,
+    redacted_reason TEXT,
     fts           tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
 CREATE INDEX idx_comments_thread ON comments (thread_id, created_at);
@@ -158,6 +162,17 @@ CREATE TABLE comment_revisions (            -- immutable edit history (substrate
     comment_id TEXT NOT NULL REFERENCES comments (id) ON DELETE CASCADE,
     body       TEXT NOT NULL,
     edited_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Protected store of pre-redaction content (§5b). Retained forever; readable only by
+-- administrators/auditors. On redaction the original body is moved here and the comment's
+-- displayed body/body_text are masked and its comment_chunks removed (de-indexed).
+CREATE TABLE redactions (
+    comment_id   TEXT NOT NULL REFERENCES comments (id) ON DELETE CASCADE,
+    original_body TEXT NOT NULL,               -- the exact Markdown that was said
+    redacted_by  TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    redacted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE mentions (
@@ -281,18 +296,23 @@ requesting user** (`ManagedFiles(user_name=…, user_roles=…, tenant=…)`), i
 | Action | Core permission required on `file_uid` |
 |--------|----------------------------------------|
 | List/read threads & comments on a document | **READ** |
-| Open a thread; post a comment/reply; @mention; raise a review request | **READ** (PR-review semantics — a reviewer need not be able to edit the file) |
-| Resolve / reopen a thread | Thread `opened_by`, **or** anyone with **WRITE**, **or** an assigned reviewer |
+| Open a thread; post a comment/reply; @mention; raise a review request | **READ** — *decided*: PR-review semantics; a reviewer need not be able to edit the file |
+| Resolve / reopen a thread | Thread `opened_by`, **or** anyone with **WRITE**, **or** an assigned reviewer — *decided*: WRITE can resolve any thread |
 | Edit / delete **own** comment | Author only (edits versioned in `comment_revisions`; deletes tombstone + audit) |
-| Edit / delete **another user's** comment | Never (not even WRITE-holders — canon is append-only; moderation is a separate, later concern) |
+| Edit / delete **another user's** comment | Never — no user, not even a WRITE-holder, may alter another's words (append-only canon) |
+| **Redact** any comment (moderation) | **Tenant administrator** only — masks the *displayed* content and de-indexes it (§6); the original is **retained, never destroyed** (§5b). A redaction, not a delete |
 | Acknowledge / complete a review request | The named `reviewer` only |
 
 **Two ACL-safety invariants (the analogue of CSAI's retrieval-time gating):**
 
-1. **A mention/flag can never leak a document's existence.** Before a `@mention` or `reviewer`
-   assignment is accepted, verify the *target* user has READ on the anchor `file_uid` (core
-   `CheckPermission` as that target). If not, the mention is rejected — you cannot flag someone
-   into a document they can't see. Same principle as "never notified about a file you can't see".
+1. **A mention/flag can never leak a document's existence.** The author may address *any* email —
+   there is no pre-filtered "eligible users" picker (that discovery feature is deferred, §15). Instead,
+   **on submit** the service checks each referenced target's READ on the anchor `file_uid` (core
+   `CheckPermission` as that target). A target **without** READ is **rejected and error-marked**: the
+   submit returns a per-reference validation error identifying which addressed users lack access, and
+   no mention/assignment is persisted for them (the author can remove or replace the reference and
+   resubmit). You cannot flag someone into a document they can't see — same principle as "never
+   notified about a file you can't see". Applies identically to `@mention` and `reviewer` assignment.
 2. **Every read path re-checks at query time.** Threads, comments, and notifications are filtered
    through `can_read(file_uid)` at fetch time (over-fetch → filter, exactly like CSAI's search/
    retrieval), not trusted from a stored snapshot. A `notifications` row therefore carries
@@ -308,6 +328,28 @@ for indexing writes and internal maintenance — never to answer a user request.
 impersonation rule, no user-facing query ever runs as a privileged service account and filters
 afterward.
 
+### 5b. Administrator redaction (moderation without destruction)
+
+Comments are append-only canon, but compliance needs a way to remove harmful or mistakenly-posted
+content from view. The answer is **redaction, never deletion**: a **tenant administrator** (the
+`require_tenant_admin` check — LDAP `cn=administrators,ou=<tenant>` membership, per `ldap_manager`)
+may redact any comment, but the information is **retained forever, never destroyed**.
+
+Redacting a comment (`redacted = true`, with `redacted_by`, `redacted_at`, `redacted_reason`):
+- **Masks the displayed content** — readers see a "[redacted by administrator]" placeholder plus the
+  reason and actor; `body`/`body_text` no longer surface the original text to normal readers.
+- **De-indexes it** — the comment's `comment_chunks` rows are removed (§6), so redacted content can
+  never resurface through search or the RAG chat.
+- **Preserves the original** — the pre-redaction Markdown is moved to the protected `redactions`
+  table (§4), readable only by administrators/auditors, and is **never purged** by any normal
+  operation. This satisfies legal-hold: an auditor can always recover exactly what was said and by
+  whom, while the wider tenant cannot.
+
+Redaction is the *only* way anyone other than a comment's own author affects its content, and even
+then it obscures rather than erases. (True destruction of information, if ever needed, would be a
+separate, explicitly-gated retention operation — deliberately out of scope here, mirroring the
+core's `CULL_VERSIONS` "destroy-data must be granted explicitly" stance.)
+
 ---
 
 ## 6. Indexing & RAG exposure
@@ -317,7 +359,9 @@ the chat vector database … retrievable by the RAG pipeline as context for futu
 
 **Mechanism:** on comment create/edit/delete, the service chunks + embeds the **plaintext
 projection** (`body_text`, Markdown markup stripped — §4a), not the raw Markdown, so search and
-embeddings match on words rather than formatting characters. Uses the pluggable embedding provider
+embeddings match on words rather than formatting characters. On **redaction** (§5b) and author
+**delete**, the comment's `comment_chunks` rows are **removed**, so masked content can never resurface
+through search or the RAG chat. Uses the pluggable embedding provider
 (CSAI `providers/embeddings.py` pattern) into `comment_chunks`, **tagged with the anchor
 `file_uid`**. Because a comment inherits its anchor's ACL, keying chunks by `file_uid` means the
 *existing* `can_read(file_uid)` gate is exactly the right filter — **no new permission logic** is
@@ -406,10 +450,11 @@ GET    /whoami
 GET    /files/{file_uid}/threads              # ?version= ?status=open|resolved ; READ-gated
 POST   /files/{file_uid}/threads              # open a thread {version?, title, body}  (region: V2)
 GET    /threads/{id}                          # thread + comments (re-checks READ)
-POST   /threads/{id}/comments                 # reply {body, mentions:[user]}  (validates each mention: §5.1)
-PATCH  /threads/{id}                          # resolve/reopen {status, resolved_version?}
+POST   /threads/{id}/comments                 # reply {body, mentions:[email]}  (validate READ per target, error-mark: §5.1)
+PATCH  /threads/{id}                          # resolve/reopen {status, resolved_version?}  (opener|WRITE|reviewer)
 PATCH  /comments/{id}                         # edit own comment (versioned)
 DELETE /comments/{id}                         # soft-delete own comment
+POST   /comments/{id}/redact                  # tenant-admin only: mask + de-index; original → redactions {reason} (§5b)
 
 # Review requests
 POST   /files/{file_uid}/reviews              # {reviewers:[user], version?, thread_id?}  (validates reviewer READ)
@@ -440,9 +485,10 @@ POST   /internal/retrieve                     # RAG source for CSAI (Option A, �
 Two surfaces, both mirroring existing SPA conventions (service client + Pinia store + view):
 
 ### 10a. The dashboard (landing surface)
-A new authed view — proposed route **`/dashboard`** (`requiresAuth`), and the **post-login
-landing** (change `/` redirect from `/files` → `/dashboard`; *open decision* in §15). Structurally
-like `ChatView`/`TenantAdminView` (two-pane / tabbed). Two feeds, per the original stub:
+A new authed view at route **`/dashboard`** (`requiresAuth`). **Decided: it is the post-login
+landing** — `router/index.ts` redirects `/` → `/dashboard` (replacing the current `/` → `/files`);
+the file browser remains a first-class destination reachable from the nav. Structurally like
+`ChatView`/`TenantAdminView` (two-pane / tabbed). Two feeds, per the original stub:
 
 1. **Attention feed** — messages/threads/reviews requesting the user's attention
    (`GET /dashboard/attention`): mentions, replies to your threads, review requests assigned to you,
@@ -472,9 +518,10 @@ message) providing **basic rich-text formatting** over the constrained-Markdown 
 - **Toolbar** with bold, italic, inline code, code block, bulleted list, numbered list, blockquote,
   and link — plus their standard keyboard shortcuts (⌘/Ctrl-B, -I, etc.). The visible controls are
   exactly the §4a allowlist; nothing that would produce disallowed markup is offered.
-- **Markdown in, Markdown out.** The editor's value is the raw Markdown persisted to `comments.body`
-  — whether implemented as a WYSIWYG surface that serializes to Markdown or a textarea with a
-  format toolbar is an implementation choice (§15), but the wire/storage format is always Markdown.
+- **Markdown in, Markdown out.** **Decided: a lightweight editor** — a textarea (or minimal
+  contenteditable) with a format toolbar that inserts Markdown syntax and **serializes to Markdown** —
+  not a heavyweight WYSIWYG/ProseMirror stack. The editor's value is the raw Markdown persisted to
+  `comments.body`; the wire/storage format is always Markdown.
 - **Rendering** uses a shared `renderMarkdown()` util (markdown renderer → strict allowlist
   sanitizer, §12) reused by both the editor preview and the read view, so authored and displayed
   output can never diverge and unsanitized HTML never reaches the DOM. **The SPA already ships
@@ -544,10 +591,11 @@ Shared `FILEENGINE_*` reused verbatim (gRPC core, LDAP, Redis, JWT secret). Serv
    `client_for`/`agent_client`, health/ready. (Twin of CSAI bootstrap.)
 2. **M1 — threads & comments:** anchor to `file_uid`/`version`; open/reply/resolve; READ/WRITE
    gating via core checks; own-comment edit/delete with revision history. REST + tests.
-3. **M2 — mentions & review requests:** the §5.1 mention-safety check; review state machine;
+3. **M2 — mentions, reviews & moderation:** the §5.1 address-anything-then-validate-on-submit
+   mention check; review state machine; admin redaction (§5b, `redactions` table + de-index);
    `notifications` writes; emit `discussion:events`.
 4. **M3 — indexing & RAG:** `comment_chunks` embed/store; comment search; CSAI retrieval integration
-   (ship Option B or A per §6).
+   (Option A internal retrieve endpoint, §6).
 5. **M4 — dashboard:** `/dashboard/attention` + `/dashboard/activity`; SPA view, `ThreadPanel`,
    client/store; core-event-fed activity feed.
 6. **M5 — MCP door + provenance hook:** MCP tools as agent identity; `discussion_thread` provenance
@@ -558,29 +606,29 @@ dashboard's activity feed is the in-app half and the chat-delivered digest waits
 
 ---
 
-## 15. Open questions
+## 15. Decisions & remaining scope
 
-1. **Landing route (§10a):** does `/` become `/dashboard`, or does the dashboard live alongside
-   `/files` and the user chooses a default? Affects `router/index.ts`.
-2. **Comment-permission altitude (§5):** confirm "READ can comment" (PR-review semantics) vs a
-   stricter "WRITE to comment" for some tenants. Likely a per-tenant policy toggle — but v1 picks
-   one default (proposed: READ).
-3. **Resolution authority:** is WRITE-on-file sufficient to resolve *any* thread, or only the opener/
-   reviewer? (Spec currently allows WRITE — revisit with QMS/compliance needs.)
-4. **Mention target discovery:** the picker must only surface users who have READ on the anchor —
-   does `ldap_manager`/core expose an efficient "who-can-read(file_uid)" query, or do we check
-   per-candidate at submit time (safe but chatty)?
-5. **V2 — in-document entity anchoring (§1):** the deferred region-anchoring capability (IFC/BIM
-   element GUID, PDF page/rect, point-cloud/LAS bbox, drawing coordinate) is its own **V2
-   specification**, covering per-viewer coordinate models and picking/overlay interaction. Not a v1
-   open question — tracked here only so the v1 anchor stays additively extensible toward it.
-6. **Retention/moderation:** comments are append-only canon; what is the tenant-admin story for
-   redaction/legal-hold, given "no editing others' comments"?
-7. **Editor implementation (§10c):** WYSIWYG-that-serializes-to-Markdown (e.g. Tiptap/Milkdown/
-   ProseMirror) vs a lightweight textarea + format-toolbar + preview? Prefer reusing whatever
-   Markdown renderer/sanitizer already backs the chat/report views before adding a dependency. The
-   storage contract (constrained Markdown, §4a) is fixed regardless of the choice.
+**Resolved for v1:**
+1. **Landing route (§10a):** `/` redirects to `/dashboard`; the dashboard is the post-login landing
+   (the file browser stays reachable from the nav).
+2. **Comment altitude (§5):** **READ** can comment — PR-review semantics. (A stricter per-tenant
+   WRITE-to-comment policy is a *possible* future toggle, not built in v1.)
+3. **Resolution authority (§5):** **WRITE**-on-file may resolve any thread, alongside the thread
+   opener and assigned reviewers.
+4. **Mention validation (§5.1):** authors may address **any** email; the service checks READ **on
+   submit** and **error-marks** any referenced user lacking access — no persisted mention for them,
+   no eligible-user pre-filter.
+5. **Moderation (§5b):** tenant administrators may **redact** (mask display + de-index) a comment;
+   the original is **retained forever, never destroyed**. No one else may alter another's words.
+6. **Comment editor (§10c):** a **lightweight** toolbar editor that serializes to Markdown (no
+   heavyweight WYSIWYG); render via the SPA's existing `marked` + `dompurify`.
+7. **RAG/CSAI exposure (§6):** **Option A** — internal retrieve endpoint; each service owns its data.
 
-**Resolved:** RAG/CSAI integration is **Option A** (internal retrieve endpoint; each service owns its
-data) — see §6.
-```
+**Deferred to a V2 specification:**
+- **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
+  element GUID, PDF page/rect, point-cloud/LAS bbox, drawing coordinate — with per-viewer coordinate
+  models and picking/overlay interaction. The v1 anchor `(file_uid, version?)` extends to it additively.
+- **Mention target discovery (§5.1):** an eligible-user picker driven by a "who-can-read(`file_uid`)"
+  lookup, as an ergonomic upgrade over v1's address-anything-then-validate-on-submit.
+
+No v1-blocking questions remain open.
