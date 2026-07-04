@@ -564,11 +564,23 @@ switchable from a control in the panel/preview header, with three modes:
 
 | Mode | Behaviour |
 |------|-----------|
-| **Collapsed** | Panel hidden; only a compact affordance (a "Comments (N)" toggle/tab, with an unread/attention marker) remains, so the preview gets the full viewport. Default when there are no threads. |
+| **Collapsed** | Panel hidden; only a compact toggle/tab remains, so the preview gets the full viewport. The toggle shows the **comment count** for the document (e.g. "Comments (N)") and, when the current user has something waiting on this document, an **attention flag** (§10b-i). Default when there are no threads. |
 | **Pinned right** | Panel docked as a right-hand sidebar; the preview content reflows to the remaining width. Best for tall/portrait documents and wide screens. Default when threads exist on a wide screen. |
 | **Pinned bottom** | Panel docked as a bottom drawer; the preview reflows to the remaining height. Best for wide/landscape content and 3D/BIM views. |
 
 Details:
+- **(10b-i) Collapsed count + attention flag.** The collapsed toggle always shows the document's
+  **comment count** (open threads / total comments). Alongside it, an **attention flag** appears when
+  the current user has something waiting **on this document**, distinguishing two states drawn from
+  the user's own records (ACL-scoped, §5):
+  - **Flagged** — the user is `@mention`ed in an unresolved thread here (a `mentions` row targeting
+    them, §4). Icon/label e.g. "@ you".
+  - **Needs review** — the user is the `reviewer` on a `review_requests` row for this document still
+    in `requested`/`acknowledged` state (§4). Icon/label e.g. "Review requested".
+  Both together show a combined marker with a count. The flag mirrors the dashboard attention feed
+  (§10a) but scoped to the open document, so a reviewer/mentioned user sees the pull to act without
+  expanding the panel. It clears as the underlying items resolve (mention's thread resolved, review
+  completed) and re-checks READ so it never lights up for content the user can no longer see.
 - **Persisted preference.** The chosen mode is remembered in `localStorage` (e.g.
   `fe.discuss.panelLayout`), mirroring the existing viewer-preference convention (e.g. the model
   viewer's `fe.model3d.sidebarCollapsed`). It is a per-browser UI preference, **not** server state —
@@ -827,7 +839,8 @@ reusing the same builder.
    push** (Phase 3 delivery; the Phase 2 substrate is a prerequisite).
 9. **Preview panel layout (§10b):** the inline `ThreadPanel` in `PreviewView` is user-switchable
    between **collapsed / pinned-right / pinned-bottom**, persisted per-browser in `localStorage`;
-   pinned modes reflow the preview (no overlay).
+   pinned modes reflow the preview (no overlay). Collapsed shows the **comment count** plus an
+   **attention flag** when the user is @mentioned (flagged) or has a pending review here.
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
