@@ -41,13 +41,17 @@ class DigestSender:
 
     # -- content ------------------------------------------------------------
     def build(self, identity: Identity, since_iso: str, *, want_activity: bool = True) -> dict:
-        """Gather this recipient's items since ``since_iso``, ACL-filtered as them."""
+        """Gather this recipient's items since ``since_iso``, filtered as them: must
+        be READable AND still live (not soft-deleted), the same guard the dashboard
+        feeds apply — a trashed document must not surface in the digest either."""
+        def _visible(file_uid: str) -> bool:
+            return self.perms.can_read(identity, file_uid) and self.perms.is_live(identity, file_uid)
         notes = self.notifications.list_for(identity.tenant, identity.user, limit=200, since=since_iso)
-        notes = [n for n in notes if self.perms.can_read(identity, n["file_uid"])]
+        notes = [n for n in notes if _visible(n["file_uid"])]
         acts: list[dict] = []
         if want_activity:
             acts = self.activity.recent(identity.tenant, limit=200, since=since_iso)
-            acts = [a for a in acts if self.perms.can_read(identity, a["file_uid"])]
+            acts = [a for a in acts if _visible(a["file_uid"])]
         return {"attention": notes, "activity": acts}
 
     def render(self, content: dict) -> tuple[str, str, str]:

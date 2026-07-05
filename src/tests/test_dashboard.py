@@ -82,6 +82,18 @@ def test_attention_feed_is_acl_filtered(make):
     assert [i["id"] for i in items] == [1]
 
 
+def test_attention_feed_excludes_deleted(make):
+    # Both readable, but f2 is soft-deleted → its notification must not surface
+    # (same live guard as the activity feed).
+    rows = [{"id": 1, "user_id": "bob", "kind": "mention", "file_uid": "f1", "thread_id": "t1",
+             "review_id": None, "actor": "carol", "created_at": "t", "read_at": None},
+            {"id": 2, "user_id": "bob", "kind": "reply", "file_uid": "f2", "thread_id": "t2",
+             "review_id": None, "actor": "carol", "created_at": "t", "read_at": None}]
+    c = make(reads=True, live={"f1"}, notes=rows)   # f2 not live (deleted)
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert [i["id"] for i in items] == [1]
+
+
 def test_mark_seen(make):
     rows = [{"id": 5, "user_id": "bob", "kind": "mention", "file_uid": "f1", "thread_id": None,
              "review_id": None, "actor": "carol", "created_at": "t", "read_at": None}]

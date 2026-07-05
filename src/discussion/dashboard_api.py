@@ -6,9 +6,10 @@
   POST /attention/flags            per-file flagged/needs-review counts, batch (§10e)
   GET  /comments/{id}              resolve a comment (for a `?comment=` permalink, §10f)
 
-Every read re-checks READ on the anchor ``file_uid`` as the caller — the same
-`notifications` / `mentions` / `review_requests` records that feed the digest and
-the in-preview flag, so all attention surfaces stay consistent (§10a).
+Every feed read re-checks, per row, that the anchor ``file_uid`` is both READable
+as the caller AND still live (not soft-deleted) — so a lost-access or trashed
+document disappears from every surface. The digest applies the same two-part guard,
+keeping all attention/activity surfaces consistent (§10a).
 """
 from __future__ import annotations
 
@@ -41,10 +42,12 @@ async def attention(request: Request, limit: int = Query(50, ge=1, le=200),
     rows = await run_in_threadpool(partial(
         _s(request, "notifications").list_for, ident.tenant, ident.user,
         limit=limit, unread_only=unread))
-    # Re-check READ per row (over-fetch → filter), so a lost-access item disappears.
+    # Re-check READ per row (over-fetch → filter), so a lost-access item disappears,
+    # and drop items whose anchor file is soft-deleted (same guard as the activity
+    # feed) — a trashed document must not surface in any dashboard feed.
     out = []
     for r in rows:
-        if await _readable(request, ident, r["file_uid"]):
+        if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
             out.append(r)
     return {"items": out}
 

@@ -69,13 +69,13 @@ class FakeMailer:
         return self.ok
 
 
-def _sender(*, notes=None, activity=None, digest=None, reads=True, mailer=None):
+def _sender(*, notes=None, activity=None, digest=None, reads=True, live=True, mailer=None):
     return DigestSender(
         Config(),
         digest_store=digest or FakeDigest(),
         notifications=FakeNotes(notes),
         activity=FakeActivity(activity),
-        permissions=FakePerms(reads=reads),
+        permissions=FakePerms(reads=reads, live=live),
         directory=FakeDirectory(),
         mailer=mailer or FakeMailer(),
     ), mailer
@@ -95,6 +95,14 @@ def _sub(user="bob", cadence="hourly", **kw):
 
 def test_build_acl_filters():
     s, _ = _sender(notes=[_note("bob", "f1"), _note("bob", "f2")], reads={"f1"})
+    content = s.build(Identity(user="bob", tenant="default"), "since")
+    assert [n["file_uid"] for n in content["attention"]] == ["f1"]
+
+
+def test_build_excludes_deleted():
+    # Both readable, but f2 is soft-deleted → excluded from the digest, same as the
+    # dashboard feeds.
+    s, _ = _sender(notes=[_note("bob", "f1"), _note("bob", "f2")], reads=True, live={"f1"})
     content = s.build(Identity(user="bob", tenant="default"), "since")
     assert [n["file_uid"] for n in content["attention"]] == ["f1"]
 
