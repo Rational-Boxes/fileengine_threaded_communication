@@ -123,16 +123,31 @@ class ThreadStore:
 
     # -- comments ------------------------------------------------------------
     def add_comment(self, tenant: str, thread_id: str, *, author: str, body: str,
-                    body_text: str) -> dict:
+                    body_text: str, parent_comment_id: Optional[str] = None) -> dict:
         cid = _uid()
         with self._conn(tenant) as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO comments (id, thread_id, author, body, body_text) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (cid, thread_id, author, body, body_text))
+                "INSERT INTO comments (id, thread_id, parent_comment_id, author, body, body_text) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (cid, thread_id, parent_comment_id, author, body, body_text))
             cur.execute("UPDATE threads SET updated_at = now() WHERE id = %s", (thread_id,))
             conn.commit()
         return self.get_comment(tenant, cid)
+
+    def comment_parent_thread(self, tenant: str, comment_id: str) -> Optional[str]:
+        """The thread_id a (parent) comment belongs to — for validating a reply target."""
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute("SELECT thread_id FROM comments WHERE id = %s", (comment_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def list_revisions(self, tenant: str, comment_id: str) -> list[dict]:
+        """Prior versions of an edited comment (newest first). Empty if never edited."""
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT body, edited_at FROM comment_revisions WHERE comment_id = %s "
+                "ORDER BY edited_at DESC", (comment_id,))
+            return [{"body": r[0], "edited_at": _val(r[1])} for r in cur.fetchall()]
 
     def get_comment(self, tenant: str, comment_id: str) -> Optional[dict]:
         """A comment plus its thread's ``file_uid`` (the ACL key)."""

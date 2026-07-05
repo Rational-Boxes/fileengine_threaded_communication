@@ -66,3 +66,44 @@ class Directory:
             return None
         finally:
             svc.unbind()
+
+    def search(self, query: str, limit: int = 8) -> list[Identity]:
+        """Candidate users matching ``query`` (uid/email/name substring), with roles
+        resolved — for @mention autocomplete. The caller ACL-filters by the anchor
+        (§5.1). Returns [] on empty query or an unreachable directory."""
+        cfg = self.config
+        q = (query or "").strip()
+        if not q:
+            return []
+        try:
+            server = Server(cfg.ldap_uri, get_info=ALL)
+            svc = Connection(server, cfg.ldap_bind_dn, cfg.ldap_bind_password, auto_bind=True)
+        except LDAPException:
+            log.warning("directory: service bind failed", exc_info=True)
+            return []
+        out: list[Identity] = []
+        try:
+            svc.search(cfg.ldap_user_base, f"(|(uid=*{q}*)(mail=*{q}*)(cn=*{q}*))",
+                       search_scope=SUBTREE, attributes=["uid", "cn", "mail"], size_limit=limit * 4)
+            for entry in svc.entries[:limit]:
+                uid = str(entry.uid) if "uid" in entry else ""
+                if not uid:
+                    continue
+                email = str(entry.mail) if "mail" in entry and entry.mail else ""
+                roles: list[str] = []
+                svc.search(cfg.ldap_tenant_base,
+                           f"(&(objectClass=groupOfNames)(member={entry.entry_dn}))",
+                           search_scope=SUBTREE, attributes=["cn"])
+                for e in svc.entries:
+                    cn = str(e.cn)
+                    if cn and cn not in roles:
+                        roles.append(cn)
+                if "administrators" in roles and "system_admin" not in roles:
+                    roles.append("system_admin")
+                out.append(Identity(user=uid, roles=roles, tenant=cfg.tenant,
+                                    authenticated=False, email=email))
+        except LDAPException:
+            log.warning("directory: search failed for %s", q, exc_info=True)
+        finally:
+            svc.unbind()
+        return out

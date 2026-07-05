@@ -17,7 +17,7 @@ from discussion.ldap_auth import Identity
 # ------------------------------- fakes -------------------------------------
 class FakeStore:
     def __init__(self):
-        self.threads, self.comments, self.mentions = {}, {}, []
+        self.threads, self.comments, self.mentions, self.revisions = {}, {}, [], {}
         self._n = 0
 
     def _id(self, p):
@@ -26,7 +26,9 @@ class FakeStore:
 
     def _view(self, c):
         body = "" if (c["deleted"] or c["redacted"]) else c["body"]
-        return {"id": c["id"], "thread_id": c["thread_id"], "author": c["author"], "body": body,
+        return {"id": c["id"], "thread_id": c["thread_id"],
+                "parent_comment_id": c.get("parent_comment_id"),
+                "author": c["author"], "body": body,
                 "created_at": c["created_at"], "edited_at": c["edited_at"], "deleted": c["deleted"],
                 "redacted": c["redacted"], "redacted_by": c.get("redacted_by"),
                 "redacted_reason": c.get("redacted_reason")}
@@ -39,7 +41,7 @@ class FakeStore:
                              "anchor_stale": False}
         self.comments[cid] = {"id": cid, "thread_id": tid, "author": opened_by, "body": body,
                               "body_text": body_text, "created_at": "t0", "edited_at": None,
-                              "deleted": False, "redacted": False}
+                              "deleted": False, "redacted": False, "parent_comment_id": None}
         return self.get_thread(tenant, tid)
 
     def list_threads(self, tenant, file_uid, *, status=None):
@@ -66,12 +68,20 @@ class FakeStore:
         t.update(status=status, resolved_by=resolved_by, resolved_version=resolved_version)
         return self.get_thread(tenant, thread_id)
 
-    def add_comment(self, tenant, thread_id, *, author, body, body_text):
+    def add_comment(self, tenant, thread_id, *, author, body, body_text, parent_comment_id=None):
         cid = self._id("c")
         self.comments[cid] = {"id": cid, "thread_id": thread_id, "author": author, "body": body,
                               "body_text": body_text, "created_at": "t1", "edited_at": None,
-                              "deleted": False, "redacted": False}
+                              "deleted": False, "redacted": False,
+                              "parent_comment_id": parent_comment_id}
         return self.get_comment(tenant, cid)
+
+    def comment_parent_thread(self, tenant, comment_id):
+        c = self.comments.get(comment_id)
+        return c["thread_id"] if c else None
+
+    def list_revisions(self, tenant, comment_id):
+        return list(self.revisions.get(comment_id, []))
 
     def get_comment(self, tenant, comment_id):
         c = self.comments.get(comment_id)
@@ -85,6 +95,7 @@ class FakeStore:
         c = self.comments.get(comment_id)
         if c is None or c["deleted"] or c["redacted"]:
             return None
+        self.revisions.setdefault(comment_id, []).insert(0, {"body": c["body"], "edited_at": "t1"})
         c.update(body=body, body_text=body_text, edited_at="t2")
         return self.get_comment(tenant, comment_id)
 
@@ -144,6 +155,13 @@ class FakeDirectory:
     def resolve_principal(self, identifier):
         uid = self.mapping.get(identifier)
         return None if uid is None else Identity(user=uid, roles=["users"], tenant="default")
+
+    def search(self, q, limit=8):
+        ql = (q or "").lower()
+        out = [Identity(user=uid, roles=["users"], tenant="default", email=ident)
+               for ident, uid in self.mapping.items()
+               if ql in ident.lower() or ql in uid.lower()]
+        return out[:limit]
 
 
 class FakeNotes:
@@ -350,6 +368,41 @@ def test_comment_indexed_on_write_and_deindexed_on_delete(make):
     assert any(x["comment_id"] == cid for x in c.indexer.indexed)
     c.client.delete(f"/comments/{cid}", headers=_auth("carol"))
     assert cid in c.indexer.removed
+
+
+def test_nested_reply(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "root"}, headers=_auth("bob")).json()["id"]
+    root_cid = c.client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"][0]["id"]
+    r = c.client.post(f"/threads/{tid}/comments",
+                      json={"body": "a reply", "parent_comment_id": root_cid}, headers=_auth("carol"))
+    assert r.status_code == 201 and r.json()["parent_comment_id"] == root_cid
+    # A parent from a different thread is rejected.
+    tid2 = c.client.post("/files/f2/threads", json={"body": "other"}, headers=_auth("bob")).json()["id"]
+    other_cid = c.client.get(f"/threads/{tid2}", headers=_auth("bob")).json()["comments"][0]["id"]
+    assert c.client.post(f"/threads/{tid}/comments",
+                         json={"body": "x", "parent_comment_id": other_cid},
+                         headers=_auth("bob")).status_code == 422
+
+
+def test_comment_revisions(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    cid = c.client.post(f"/threads/{tid}/comments", json={"body": "first"},
+                        headers=_auth("carol")).json()["id"]
+    c.client.patch(f"/comments/{cid}", json={"body": "second"}, headers=_auth("carol"))
+    revs = c.client.get(f"/comments/{cid}/revisions", headers=_auth("bob")).json()["revisions"]
+    assert [r["body"] for r in revs] == ["first"]   # prior version retained
+
+
+def test_mentionable_autocomplete(make):
+    c = make(reads=True, directory=FakeDirectory({"carol@x": "carol", "dave@x": "dave"}))
+    users = c.client.get("/files/f1/mentionable?q=car", headers=_auth("bob")).json()["users"]
+    assert [u["user"] for u in users] == ["carol"]
+
+    # A candidate who can't read the file is filtered out.
+    c2 = make(reads=True, deny_users={"carol"}, directory=FakeDirectory({"carol@x": "carol"}))
+    assert c2.client.get("/files/f1/mentionable?q=car", headers=_auth("bob")).json()["users"] == []
 
 
 def test_thread_provenance_endpoint(make):

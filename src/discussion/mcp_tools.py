@@ -88,7 +88,8 @@ class Toolset:
         return thread
 
     def post_comment(self, ident: Identity, thread_id: str, *, body: str,
-                     mentions: list[str] | None = None) -> dict:
+                     mentions: list[str] | None = None,
+                     parent_comment_id: str | None = None) -> dict:
         meta = self.c.store.thread_meta(ident.tenant, thread_id)
         if meta is None:
             raise ToolError("thread not found")
@@ -97,6 +98,8 @@ class Toolset:
         text = (body or "").strip()
         if not text:
             raise ToolError("comment body is required")
+        if parent_comment_id and self.c.store.comment_parent_thread(ident.tenant, parent_comment_id) != thread_id:
+            raise ToolError("parent_comment_id is not in this thread")
 
         valid = []
         if mentions:
@@ -105,7 +108,8 @@ class Toolset:
                 raise ToolError("some mentioned users cannot access this file: " + ", ".join(invalid))
 
         comment = self.c.store.add_comment(ident.tenant, thread_id, author=ident.user,
-                                           body=text, body_text=to_plaintext(text))
+                                           body=text, body_text=to_plaintext(text),
+                                           parent_comment_id=parent_comment_id)
         self._index(ident.tenant, comment["id"], file_uid, thread_id, to_plaintext(text))
 
         mentioned = set()

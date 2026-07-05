@@ -204,6 +204,13 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
     await _require(request, ident, file_uid, "r")
     text = _clean_body(request, (body or {}).get("body"))
 
+    # Nested reply (§4/#14): the parent must belong to this thread.
+    parent_id = (body or {}).get("parent_comment_id") or None
+    if parent_id:
+        parent_thread = await run_in_threadpool(store.comment_parent_thread, ident.tenant, parent_id)
+        if parent_thread != thread_id:
+            raise HTTPException(status_code=422, detail="parent_comment_id is not in this thread")
+
     # Validate mentions *before* writing (§5.1): any target lacking READ error-marks
     # the whole submit so the author can fix and resubmit — no partial mention.
     mentions = (body or {}).get("mentions") or []
@@ -218,7 +225,7 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
 
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
-        body=text, body_text=to_plaintext(text)))
+        body=text, body_text=to_plaintext(text), parent_comment_id=parent_id))
     await _index(request, ident.tenant, comment_id=comment["id"], file_uid=file_uid,
                  thread_id=thread_id, text=to_plaintext(text))
     await _live(request, ident.tenant, file_uid,
@@ -268,6 +275,36 @@ async def edit_comment(comment_id: str, request: Request, body: dict = Body(...)
                 {"type": "comment", "action": "updated", "thread_id": updated["thread_id"],
                  "comment": updated})
     return updated
+
+
+@router.get("/comments/{comment_id}/revisions")
+async def comment_revisions(comment_id: str, request: Request,
+                            ident: Identity = Depends(identity)) -> dict:
+    """Prior versions of an edited comment (#15). READ-gated on the anchor."""
+    store = _s(request, "store")
+    comment = await run_in_threadpool(store.get_comment, ident.tenant, comment_id)
+    if comment is None:
+        raise HTTPException(status_code=404, detail="comment not found")
+    await _require(request, ident, comment["file_uid"], "r")
+    revisions = await run_in_threadpool(store.list_revisions, ident.tenant, comment_id)
+    return {"revisions": revisions}
+
+
+def _mentionable_readers(directory, perms, file_uid: str, q: str) -> list[dict]:
+    """LDAP search + ACL filter, run as one blocking unit off the event loop."""
+    return [{"user": c.user, "email": c.email}
+            for c in directory.search(q, 8) if perms.can_read(c, file_uid)]
+
+
+@router.get("/files/{file_uid}/mentionable")
+async def mentionable(file_uid: str, request: Request, q: str = Query(..., min_length=1),
+                      ident: Identity = Depends(identity)) -> dict:
+    """@mention autocomplete (#16 / §5.1): users matching `q` who can READ this file.
+    The caller must be able to READ it too."""
+    await _require(request, ident, file_uid, "r")
+    users = await run_in_threadpool(
+        _mentionable_readers, _s(request, "directory"), _s(request, "permissions"), file_uid, q)
+    return {"users": users}
 
 
 @router.delete("/comments/{comment_id}")
