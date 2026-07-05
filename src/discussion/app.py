@@ -17,9 +17,11 @@ import logging
 from fastapi import FastAPI
 
 from . import __version__, audit
+from .activity_store import ActivityStore
 from .api import router
 from .bridge_auth import BridgeTokenVerifier
 from .config import Config
+from .dashboard_api import router as dashboard_router
 from .directory import Directory
 from .embeddings import build_embedder
 from .events import EventPublisher
@@ -43,7 +45,7 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
               directory: Directory | None = None, events: EventPublisher | None = None,
               notifications: NotificationStore | None = None,
               reviews: ReviewStore | None = None, indexer: Indexer | None = None,
-              searcher: Searcher | None = None) -> FastAPI:
+              searcher: Searcher | None = None, activity: ActivityStore | None = None) -> FastAPI:
     config = config or Config()
     audit.configure(config.audit_log_file)
     app = FastAPI(title="discussion", version=__version__)
@@ -77,11 +79,14 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     _chunks = ChunkStore(config)
     app.state.indexer = indexer or Indexer(_embedder, _chunks)
     app.state.searcher = searcher or Searcher(_embedder, _chunks, app.state.permissions)
+    # Dashboard feeds (M4a): the activity projection (populated by the consumer worker).
+    app.state.activity = activity or ActivityStore(config)
 
     app.include_router(router)
     app.include_router(threads_router)
     app.include_router(reviews_router)
     app.include_router(search_router)
+    app.include_router(dashboard_router)
     return app
 
 

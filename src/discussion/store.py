@@ -186,6 +186,30 @@ class ThreadStore:
                 (thread_id, thread_id))
             return [r[0] for r in cur.fetchall() if r[0]]
 
+    def mark_anchor_stale(self, tenant: str, file_uid: str, new_version: str) -> int:
+        """Mark open threads pinned to a *prior* version stale when a newer version
+        lands (§4). Threads tracking 'current' (version='') are unaffected."""
+        with self._conn(tenant) as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE threads SET anchor_stale = true "
+                "WHERE file_uid = %s AND version <> '' AND version <> %s AND status = 'open'",
+                (file_uid, new_version or ""))
+            n = cur.rowcount
+            conn.commit()
+        return n
+
+    def mention_flags(self, tenant: str, user: str, file_uids: list[str]) -> dict[str, int]:
+        """Open-thread @mention counts for ``user`` per file (attention flags, §10e)."""
+        if not file_uids:
+            return {}
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT t.file_uid, count(*) FROM mentions m JOIN threads t ON t.id = m.thread_id "
+                "WHERE m.target_user = %s AND t.status = 'open' AND t.file_uid = ANY(%s) "
+                "GROUP BY t.file_uid",
+                (user, list(file_uids)))
+            return {r[0]: int(r[1]) for r in cur.fetchall()}
+
     def redact_comment(self, tenant: str, comment_id: str, *, redacted_by: str,
                        reason: str) -> Optional[dict]:
         """Administrator redaction (§5b): move the original into ``redactions``

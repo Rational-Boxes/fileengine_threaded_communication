@@ -76,6 +76,19 @@ class ReviewStore:
             conn.commit()
         return self.get(tenant, review_id) if changed else None
 
+    def review_flags(self, tenant: str, user: str, file_uids: list[str]) -> dict[str, int]:
+        """Pending-review counts (``requested``/``acknowledged``) where ``user`` is the
+        reviewer, per file (attention flags, §10e)."""
+        if not file_uids:
+            return {}
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_uid, count(*) FROM review_requests "
+                "WHERE reviewer = %s AND status IN ('requested','acknowledged') "
+                "AND file_uid = ANY(%s) GROUP BY file_uid",
+                (user, list(file_uids)))
+            return {r[0]: int(r[1]) for r in cur.fetchall()}
+
     def list_for(self, tenant: str, user: str, *, role: str = "both",
                  status: Optional[str] = None) -> list[dict]:
         """Reviews where ``user`` is the reviewer and/or the requester."""

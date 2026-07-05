@@ -31,7 +31,16 @@ nothing merges to `main` until the service is complete.
   (FTS/fuzzy, ACL-filtered as the caller, de-duplicated); `POST /internal/retrieve`
   (Option A, §6 — system-admin only, ANN candidates NOT filtered here so CSAI applies
   its own gate).
-- **M4–M6** — dashboard/preview/live, MCP/provenance, email digest — follow.
+- **M4a — dashboard backend** ✓ READ permission cache with event-driven invalidation
+  (§5); core-event consumer (`discuss-consumer`) → `document_activity` projection +
+  `anchor_stale` marking + cache eviction (acl/role events, §8); dashboard feeds
+  (`GET /dashboard/attention` + `/activity`, ACL-filtered; `POST …/{id}/seen`); batch
+  `POST /attention/flags` (per-file @mention / pending-review counts, §10e);
+  `GET /comments/{id}` resolve for `?comment=` permalinks (§10f).
+- **M4b** — live comment sync + co-viewing presence (`WS /files/{uid}/live`, §10h) — next.
+- **Frontend** (Vue SPA: dashboard, `ThreadPanel`, flags, deep-linking) lives in the
+  `frontend` repo — a separate stage.
+- **M5–M6** — MCP door + provenance, email digest — follow.
 
 ## Layout
 
