@@ -352,6 +352,17 @@ def test_comment_indexed_on_write_and_deindexed_on_delete(make):
     assert cid in c.indexer.removed
 
 
+def test_thread_provenance_endpoint(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]
+    c.client.patch(f"/threads/{tid}", json={"status": "resolved", "resolved_version": "v9"},
+                   headers=_auth("bob"))
+    p = c.client.get(f"/threads/{tid}/provenance", headers=_auth("carol")).json()
+    assert p["source_type"] == "discussion_thread"
+    assert p["resolved_version"] == "v9"
+    assert p["permalink"].endswith(f"/preview/f1?thread={tid}")
+
+
 def test_redaction_admin_only(make):
     c = make(reads=True)
     tid = c.client.post("/files/f1/threads", json={"body": "x"}, headers=_auth("bob")).json()["id"]

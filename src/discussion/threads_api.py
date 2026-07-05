@@ -25,6 +25,7 @@ from . import audit
 from .deps import identity, require_tenant_admin
 from .ldap_auth import Identity
 from .markdown_text import to_plaintext
+from .provenance import thread_provenance
 from .targets import validate_targets
 
 router = APIRouter()
@@ -135,6 +136,22 @@ async def get_thread(thread_id: str, request: Request,
     if thread is None:
         raise HTTPException(status_code=404, detail="thread not found")
     return thread
+
+
+@router.get("/threads/{thread_id}/provenance")
+async def thread_provenance_ep(thread_id: str, request: Request,
+                               ident: Identity = Depends(identity)) -> dict:
+    """The thread's `discussion_thread` provenance descriptor (§12) — permalink,
+    participants, and the resolving-version link. READ-gated on the anchor."""
+    store = _s(request, "store")
+    meta = await run_in_threadpool(store.thread_meta, ident.tenant, thread_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="thread not found")
+    await _require(request, ident, meta["file_uid"], "r")
+    thread = await run_in_threadpool(store.get_thread, ident.tenant, thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="thread not found")
+    return thread_provenance(thread, spa_base_url=request.app.state.config.spa_base_url)
 
 
 @router.patch("/threads/{thread_id}")

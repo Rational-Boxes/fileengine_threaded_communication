@@ -21,10 +21,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "httpx>=0.27"]
+# The MCP door (§7 / M5) — FastMCP Streamable-HTTP. Optional: the core service and
+# its imports work without it (FastMCP is imported lazily in discussion.mcp_server).
+mcp = ["mcp>=1.0"]
 
 [project.scripts]
 discussion = "discussion.app:main"
 discuss-consumer = "discussion.consumer:main"   # core-event consumer (§8 / M4a)
+discuss-mcp-http = "discussion.mcp_server:main_http"   # MCP door (§7 / M5)
 # discuss-digest = "discussion.digest:main"     # added in M6 (§11c)
 
 [build-system]

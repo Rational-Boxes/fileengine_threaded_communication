@@ -44,7 +44,13 @@ nothing merges to `main` until the service is complete.
   best-effort on every mutation (never fail the write).
 - **Frontend** (Vue SPA: dashboard, `ThreadPanel`, flags, deep-linking) lives in the
   `frontend` repo — a separate stage.
-- **M5–M6** — MCP door + provenance, email digest — follow.
+- **M5 — MCP door + provenance** ✓ FastMCP Streamable-HTTP server (`discuss-mcp-http`)
+  with tools `list_threads`/`get_thread`/`open_thread`/`post_comment`/`resolve_thread`/
+  `raise_review`, each acting **as the agent's resolved identity** (per-request auth →
+  ContextVar; same ACL + mention-safety as REST, §5/§5.1). `discussion_thread`
+  provenance descriptor + `GET /threads/{id}/provenance` (permalink, participants,
+  resolving-version link, §12).
+- **M6** — email digest + `discuss-digest` cron sender — follows.
 
 ## Layout
 
