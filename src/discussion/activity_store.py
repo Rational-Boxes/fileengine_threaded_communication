@@ -34,6 +34,24 @@ class ActivityStore:
         finally:
             conn.close()
 
+    def delete_for_file(self, tenant: str, file_uid: str) -> int:
+        """Drop all activity rows for a file — called when the core reports the file
+        deleted, so neither the dashboard feed (§10a) nor the digest (§11) keeps
+        surfacing a trashed document. A later ``file.restored`` re-records the item,
+        so restoring recovers it. Returns the number of rows removed.
+        """
+        if not file_uid:
+            return 0
+        conn = connect_for_tenant(self.config, tenant, provision=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM document_activity WHERE file_uid = %s", (file_uid,))
+                removed = cur.rowcount
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+
     def recent(self, tenant: str, *, limit: int = 50, since: Optional[str] = None) -> list[dict]:
         sql = "SELECT id, file_uid, event_type, version, name, path, actor, ts FROM document_activity"
         params: list = []

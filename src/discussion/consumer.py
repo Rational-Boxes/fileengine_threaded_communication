@@ -4,6 +4,7 @@ A background worker (separate process, like CSAI's ingest) that reads
 ``fileengine:events`` and:
   - file.created/updated/restored → record document_activity (§4/§10a);
     file.updated also marks prior-version threads anchor_stale (§4).
+  - file.deleted       → prune the file's document_activity (drop it from the feed).
   - acl.changed        → evict the READ permission cache for that resource (§5).
   - role.assigned / role.member_removed → evict for that member.
   - role.deleted       → evict the whole tenant.
@@ -45,6 +46,10 @@ class EventConsumer:
                                      path=event.get("path", ""), actor=event.get("actor", ""))
             if etype == "file.updated" and uid:
                 self.store.mark_anchor_stale(tenant, uid, event.get("version", ""))
+        elif etype == "file.deleted" and uid:
+            # A soft-deleted file must drop out of the activity feed/digest. Prune its
+            # rows at the source so every reader is consistent; file.restored re-records.
+            self.activity.delete_for_file(tenant, uid)
         elif etype == "acl.changed" and uid:
             self._invalidate("invalidate_resource", tenant, uid)
         elif etype in ("role.assigned", "role.member_removed"):

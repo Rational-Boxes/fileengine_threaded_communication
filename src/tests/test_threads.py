@@ -135,10 +135,12 @@ class FakeStore:
 
 
 class FakePerms:
-    """reads/writes: True (all), None (none), or a set of allowed file_uids.
-    deny_users: uids denied READ regardless (to exercise mention error-marking)."""
-    def __init__(self, reads=True, writes=None, deny_users=frozenset()):
+    """reads/writes/live: True (all), None (none), or a set of allowed file_uids.
+    deny_users: uids denied READ regardless (to exercise mention error-marking).
+    live: which file_uids are still present (not soft-deleted); True = all live."""
+    def __init__(self, reads=True, writes=None, deny_users=frozenset(), live=True):
         self.reads, self.writes, self.deny_users = reads, writes, set(deny_users)
+        self.live = live
 
     @staticmethod
     def _ok(allow, file_uid):
@@ -151,6 +153,9 @@ class FakePerms:
 
     def can_write(self, ident, file_uid):
         return self._ok(self.writes, file_uid)
+
+    def is_live(self, ident, file_uid):
+        return self._ok(self.live, file_uid)
 
 
 class FakeDirectory:
