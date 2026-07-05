@@ -59,6 +59,24 @@ async def _notify(request: Request, tenant: str, users, *, kind: str, file_uid: 
             thread_id=thread_id))
 
 
+async def _index(request: Request, tenant: str, *, comment_id: str, file_uid: str,
+                 thread_id: str, text: str) -> None:
+    """Best-effort comment indexing (§6) — never fails the request."""
+    try:
+        await run_in_threadpool(partial(
+            _s(request, "indexer").index_comment, tenant, comment_id=comment_id,
+            file_uid=file_uid, thread_id=thread_id, text=text))
+    except Exception:
+        pass
+
+
+async def _deindex(request: Request, tenant: str, comment_id: str) -> None:
+    try:
+        await run_in_threadpool(_s(request, "indexer").remove_comment, tenant, comment_id)
+    except Exception:
+        pass
+
+
 # ------------------------------ threads ------------------------------------
 @router.get("/files/{file_uid}/threads")
 async def list_threads(file_uid: str, request: Request,
@@ -80,6 +98,9 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
     thread = await run_in_threadpool(partial(
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
         title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user))
+    if thread.get("comments"):
+        await _index(request, ident.tenant, comment_id=thread["comments"][0]["id"],
+                     file_uid=file_uid, thread_id=thread["id"], text=to_plaintext(text))
     events = _s(request, "events")
     events.publish("thread.opened", tenant=ident.tenant, file_uid=file_uid, actor=ident.user,
                    thread_id=thread["id"])
@@ -164,6 +185,8 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
         body=text, body_text=to_plaintext(text)))
+    await _index(request, ident.tenant, comment_id=comment["id"], file_uid=file_uid,
+                 thread_id=thread_id, text=to_plaintext(text))
 
     events = _s(request, "events")
     mentioned_uids = set()
@@ -203,6 +226,8 @@ async def edit_comment(comment_id: str, request: Request, body: dict = Body(...)
         store.edit_comment, ident.tenant, comment_id, body=text, body_text=to_plaintext(text)))
     if updated is None:
         raise HTTPException(status_code=409, detail="comment cannot be edited (deleted or redacted)")
+    await _index(request, ident.tenant, comment_id=comment_id, file_uid=updated["file_uid"],
+                 thread_id=updated["thread_id"], text=to_plaintext(text))
     return updated
 
 
@@ -216,6 +241,8 @@ async def delete_comment(comment_id: str, request: Request,
     if comment["author"] != ident.user:
         raise HTTPException(status_code=403, detail="only the author may delete a comment")
     ok = await run_in_threadpool(store.soft_delete_comment, ident.tenant, comment_id)
+    if ok:
+        await _deindex(request, ident.tenant, comment_id)
     return {"deleted": bool(ok)}
 
 

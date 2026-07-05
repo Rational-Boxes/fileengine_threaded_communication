@@ -25,7 +25,13 @@ nothing merges to `main` until the service is complete.
   admin redaction (`POST /comments/{id}/redact` — mask + de-index, original retained in
   `redactions`, audited, §5b); `notifications` writes (mention/reply/review/resolution);
   emits `discussion:events` to Redis (best-effort).
-- **M3–M6** — indexing/RAG, dashboard/preview/live, MCP/provenance, email digest — follow.
+- **M3 — indexing & RAG** ✓ comment `body_text` chunked + embedded into `comment_chunks`
+  on write, removed on delete/redact (best-effort, never fails the request); pluggable
+  embedder (offline hash default; OpenAI-compatible/Ollama opt-in); `GET /search`
+  (FTS/fuzzy, ACL-filtered as the caller, de-duplicated); `POST /internal/retrieve`
+  (Option A, §6 — system-admin only, ANN candidates NOT filtered here so CSAI applies
+  its own gate).
+- **M4–M6** — dashboard/preview/live, MCP/provenance, email digest — follow.
 
 ## Layout
 

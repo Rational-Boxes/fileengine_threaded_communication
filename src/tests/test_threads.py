@@ -173,10 +173,23 @@ class FakeEvents:
         return [e["type"] for e in self.published]
 
 
+class FakeIndexer:
+    def __init__(self):
+        self.indexed, self.removed = [], []
+
+    def index_comment(self, tenant, *, comment_id, file_uid, thread_id, text):
+        self.indexed.append({"comment_id": comment_id, "file_uid": file_uid,
+                             "thread_id": thread_id, "text": text})
+        return 1
+
+    def remove_comment(self, tenant, comment_id):
+        self.removed.append(comment_id)
+
+
 class Ctx:
-    def __init__(self, client, store, notes, events, directory):
+    def __init__(self, client, store, notes, events, directory, indexer):
         self.client, self.store, self.notes = client, store, notes
-        self.events, self.directory = events, directory
+        self.events, self.directory, self.indexer = events, directory, indexer
 
 
 # ------------------------------ fixtures -----------------------------------
@@ -200,13 +213,13 @@ def make(monkeypatch):
     monkeypatch.setattr("discussion.http_auth.authenticate", _fake_auth)
 
     def _make(reads=True, writes=None, deny_users=frozenset(), directory=None):
-        store, notes, events = FakeStore(), FakeNotes(), FakeEvents()
+        store, notes, events, indexer = FakeStore(), FakeNotes(), FakeEvents(), FakeIndexer()
         directory = directory or FakeDirectory()
         app = build_app(Config(), store=store,
                         permissions=FakePerms(reads=reads, writes=writes, deny_users=deny_users),
                         directory=directory, events=events, notifications=notes,
-                        reviews=object())
-        return Ctx(TestClient(app), store, notes, events, directory)
+                        reviews=object(), indexer=indexer)
+        return Ctx(TestClient(app), store, notes, events, directory, indexer)
     return _make
 
 
@@ -326,6 +339,17 @@ def test_mention_invalid_is_error_marked(make):
     # No comment/mention was persisted (only the opening comment remains).
     assert len(c.client.get(f"/threads/{tid}", headers=_auth("bob")).json()["comments"]) == 1
     assert c.store.mentions == []
+
+
+def test_comment_indexed_on_write_and_deindexed_on_delete(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "first"}, headers=_auth("bob")).json()["id"]
+    assert any(x["text"] == "first" for x in c.indexer.indexed)   # opening comment indexed
+    cid = c.client.post(f"/threads/{tid}/comments", json={"body": "reply text"},
+                        headers=_auth("carol")).json()["id"]
+    assert any(x["comment_id"] == cid for x in c.indexer.indexed)
+    c.client.delete(f"/comments/{cid}", headers=_auth("carol"))
+    assert cid in c.indexer.removed
 
 
 def test_redaction_admin_only(make):

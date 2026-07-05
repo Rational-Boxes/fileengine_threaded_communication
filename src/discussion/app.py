@@ -21,14 +21,19 @@ from .api import router
 from .bridge_auth import BridgeTokenVerifier
 from .config import Config
 from .directory import Directory
+from .embeddings import build_embedder
 from .events import EventPublisher
+from .indexing import Indexer
 from .notifications import NotificationStore
 from .permissions import Permissions
 from .reviews_api import router as reviews_router
 from .reviews_store import ReviewStore
+from .search import Searcher
+from .search_api import router as search_router
 from .store import ThreadStore
 from .threads_api import router as threads_router
 from .token_store import TokenStore
+from .vectorstore import ChunkStore
 
 log = logging.getLogger("discussion.app")
 
@@ -37,7 +42,8 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
               store: ThreadStore | None = None, permissions: Permissions | None = None,
               directory: Directory | None = None, events: EventPublisher | None = None,
               notifications: NotificationStore | None = None,
-              reviews: ReviewStore | None = None) -> FastAPI:
+              reviews: ReviewStore | None = None, indexer: Indexer | None = None,
+              searcher: Searcher | None = None) -> FastAPI:
     config = config or Config()
     audit.configure(config.audit_log_file)
     app = FastAPI(title="discussion", version=__version__)
@@ -66,10 +72,16 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     app.state.events = events or EventPublisher(config)
     app.state.notifications = notifications or NotificationStore(config)
     app.state.reviews = reviews or ReviewStore(config)
+    # Indexing & RAG (M3): shared embedder + comment_chunks store.
+    _embedder = build_embedder(config)
+    _chunks = ChunkStore(config)
+    app.state.indexer = indexer or Indexer(_embedder, _chunks)
+    app.state.searcher = searcher or Searcher(_embedder, _chunks, app.state.permissions)
 
     app.include_router(router)
     app.include_router(threads_router)
     app.include_router(reviews_router)
+    app.include_router(search_router)
     return app
 
 

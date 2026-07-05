@@ -35,3 +35,12 @@ def require_tenant_admin(request: Request) -> Identity:
     if not ident.is_admin:
         raise HTTPException(status_code=403, detail="tenant administrator required")
     return ident
+
+
+def require_system_admin(request: Request) -> Identity:
+    """Identity carrying the trusted ``system_admin`` role, or 403 — gates the
+    internal RAG retrieve endpoint (§6), called service-to-service by CSAI's agent."""
+    ident = identity(request)
+    if "system_admin" not in ident.roles:
+        raise HTTPException(status_code=403, detail="system administrator required")
+    return ident
