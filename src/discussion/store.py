@@ -89,7 +89,20 @@ class ThreadStore:
         sql += " ORDER BY created_at DESC"
         with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
             cur.execute(sql, params)
-            return _rows(cur)
+            threads = _rows(cur)
+            # Embed each thread's comment tree so the panel renders comments on
+            # (re)load — not only during the live session. One batched query.
+            if threads:
+                ids = [t["id"] for t in threads]
+                cur.execute(
+                    f"SELECT {_COMMENT_SELECT} FROM comments WHERE thread_id = ANY(%s) "
+                    f"ORDER BY created_at", (ids,))
+                by_thread: dict[str, list] = {}
+                for c in _rows(cur):
+                    by_thread.setdefault(c["thread_id"], []).append(c)
+                for t in threads:
+                    t["comments"] = by_thread.get(t["id"], [])
+            return threads
 
     def thread_meta(self, tenant: str, thread_id: str) -> Optional[dict]:
         """Just the fields needed for permission/authorization decisions."""

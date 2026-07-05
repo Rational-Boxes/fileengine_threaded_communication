@@ -45,8 +45,14 @@ class FakeStore:
         return self.get_thread(tenant, tid)
 
     def list_threads(self, tenant, file_uid, *, status=None):
-        return [dict(t) for t in self.threads.values()
-                if t["file_uid"] == file_uid and (status is None or t["status"] == status)]
+        out = []
+        for t in self.threads.values():
+            if t["file_uid"] == file_uid and (status is None or t["status"] == status):
+                row = dict(t)
+                row["comments"] = [self._view(c) for c in self.comments.values()
+                                   if c["thread_id"] == t["id"]]
+                out.append(row)
+        return out
 
     def thread_meta(self, tenant, thread_id):
         t = self.threads.get(thread_id)
@@ -368,6 +374,16 @@ def test_comment_indexed_on_write_and_deindexed_on_delete(make):
     assert any(x["comment_id"] == cid for x in c.indexer.indexed)
     c.client.delete(f"/comments/{cid}", headers=_auth("carol"))
     assert cid in c.indexer.removed
+
+
+def test_list_threads_embeds_comments(make):
+    # The panel reloads from the list endpoint; it must carry each thread's comments.
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "root msg"}, headers=_auth("bob")).json()["id"]
+    c.client.post(f"/threads/{tid}/comments", json={"body": "a reply"}, headers=_auth("carol"))
+    threads = c.client.get("/files/f1/threads", headers=_auth("bob")).json()["threads"]
+    t = next(x for x in threads if x["id"] == tid)
+    assert [cm["body"] for cm in t["comments"]] == ["root msg", "a reply"]
 
 
 def test_nested_reply(make):
