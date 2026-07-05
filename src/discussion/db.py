@@ -76,7 +76,12 @@ def connect_for_tenant(config: Config, tenant: str, provision: bool = False, rea
     whenever ``provision=True``). ``readonly=True`` routes reads to the replica during
     a master outage and skips schema DDL."""
     conn = connect(config, readonly=readonly)
-    if not readonly and (provision or tenant not in _provisioned):
+    # Provision on demand — including read-only reads, so a tenant whose *first*
+    # request is a dashboard/search read doesn't hit missing tables. Skip DDL only
+    # when this connection is a read-only replica (a standby can't run it; the
+    # master keeps the schema in sync).
+    on_replica = readonly and getattr(config, "pg_replica_enabled", False)
+    if (provision or tenant not in _provisioned) and not on_replica:
         name = ensure_tenant_schema(conn, tenant, config.embedding_dimension)
         _provisioned.add(tenant)
     else:
