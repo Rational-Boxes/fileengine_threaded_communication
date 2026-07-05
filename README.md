@@ -37,7 +37,11 @@ nothing merges to `main` until the service is complete.
   (`GET /dashboard/attention` + `/activity`, ACL-filtered; `POST …/{id}/seen`); batch
   `POST /attention/flags` (per-file @mention / pending-review counts, §10e);
   `GET /comments/{id}` resolve for `?comment=` permalinks (§10f).
-- **M4b** — live comment sync + co-viewing presence (`WS /files/{uid}/live`, §10h) — next.
+- **M4b — live sync + presence** ✓ `WS /files/{uid}/live` (§10h): `LiveHub` fans comment
+  events (created/updated/deleted/redacted/resolved) to open panels with a **per-push ACL
+  re-check** (cached); co-viewing presence roster; admin **invisible viewing** (server-
+  verified + audited); cross-replica fan-out via an injectable bridge. Handlers broadcast
+  best-effort on every mutation (never fail the write).
 - **Frontend** (Vue SPA: dashboard, `ThreadPanel`, flags, deep-linking) lives in the
   `frontend` repo — a separate stage.
 - **M5–M6** — MCP door + provenance, email digest — follow.

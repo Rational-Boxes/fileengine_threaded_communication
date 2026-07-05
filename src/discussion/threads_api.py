@@ -77,6 +77,17 @@ async def _deindex(request: Request, tenant: str, comment_id: str) -> None:
         pass
 
 
+async def _live(request: Request, tenant: str, file_uid: str, message: dict) -> None:
+    """Best-effort live fan-out to open panels on this file (§10h) — never fails a write."""
+    hub = getattr(request.app.state, "live", None)
+    if hub is None:
+        return
+    try:
+        await hub.broadcast(tenant, file_uid, message)
+    except Exception:
+        pass
+
+
 # ------------------------------ threads ------------------------------------
 @router.get("/files/{file_uid}/threads")
 async def list_threads(file_uid: str, request: Request,
@@ -99,8 +110,12 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
         title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user))
     if thread.get("comments"):
-        await _index(request, ident.tenant, comment_id=thread["comments"][0]["id"],
+        first = thread["comments"][0]
+        await _index(request, ident.tenant, comment_id=first["id"],
                      file_uid=file_uid, thread_id=thread["id"], text=to_plaintext(text))
+        await _live(request, ident.tenant, file_uid,
+                    {"type": "comment", "action": "created", "thread_id": thread["id"],
+                     "comment": first})
     events = _s(request, "events")
     events.publish("thread.opened", tenant=ident.tenant, file_uid=file_uid, actor=ident.user,
                    thread_id=thread["id"])
@@ -155,6 +170,8 @@ async def set_thread_status(thread_id: str, request: Request, body: dict = Body(
                       thread_id=thread_id)
         _s(request, "events").publish("thread.resolved", tenant=ident.tenant,
                                       file_uid=meta["file_uid"], actor=ident.user, thread_id=thread_id)
+        await _live(request, ident.tenant, meta["file_uid"],
+                    {"type": "thread", "action": "resolved", "thread_id": thread_id})
     return thread
 
 
@@ -187,6 +204,8 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
         body=text, body_text=to_plaintext(text)))
     await _index(request, ident.tenant, comment_id=comment["id"], file_uid=file_uid,
                  thread_id=thread_id, text=to_plaintext(text))
+    await _live(request, ident.tenant, file_uid,
+                {"type": "comment", "action": "created", "thread_id": thread_id, "comment": comment})
 
     events = _s(request, "events")
     mentioned_uids = set()
@@ -228,6 +247,9 @@ async def edit_comment(comment_id: str, request: Request, body: dict = Body(...)
         raise HTTPException(status_code=409, detail="comment cannot be edited (deleted or redacted)")
     await _index(request, ident.tenant, comment_id=comment_id, file_uid=updated["file_uid"],
                  thread_id=updated["thread_id"], text=to_plaintext(text))
+    await _live(request, ident.tenant, updated["file_uid"],
+                {"type": "comment", "action": "updated", "thread_id": updated["thread_id"],
+                 "comment": updated})
     return updated
 
 
@@ -243,6 +265,9 @@ async def delete_comment(comment_id: str, request: Request,
     ok = await run_in_threadpool(store.soft_delete_comment, ident.tenant, comment_id)
     if ok:
         await _deindex(request, ident.tenant, comment_id)
+        await _live(request, ident.tenant, comment["file_uid"],
+                    {"type": "comment", "action": "deleted", "thread_id": comment["thread_id"],
+                     "comment_id": comment_id})
     return {"deleted": bool(ok)}
 
 
@@ -260,4 +285,8 @@ async def redact_comment(comment_id: str, request: Request, body: dict = Body(de
         raise HTTPException(status_code=404, detail="comment not found or already redacted")
     audit.record("comment.redacted", actor=ident.user, tenant=ident.tenant,
                  comment_id=comment_id, file_uid=masked.get("file_uid", ""), reason=reason)
+    await _deindex(request, ident.tenant, comment_id)
+    await _live(request, ident.tenant, masked.get("file_uid", ""),
+                {"type": "comment", "action": "redacted", "thread_id": masked.get("thread_id"),
+                 "comment_id": comment_id})
     return masked
