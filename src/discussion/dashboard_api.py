@@ -6,9 +6,10 @@
   POST /attention/flags            per-file flagged/needs-review counts, batch (§10e)
   GET  /comments/{id}              resolve a comment (for a `?comment=` permalink, §10f)
 
-Every read re-checks READ on the anchor ``file_uid`` as the caller — the same
-`notifications` / `mentions` / `review_requests` records that feed the digest and
-the in-preview flag, so all attention surfaces stay consistent (§10a).
+Every feed read re-checks, per row, that the anchor ``file_uid`` is both READable
+as the caller AND still live (not soft-deleted) — so a lost-access or trashed
+document disappears from every surface. The digest applies the same two-part guard,
+keeping all attention/activity surfaces consistent (§10a).
 """
 from __future__ import annotations
 
@@ -31,16 +32,22 @@ async def _readable(request: Request, ident: Identity, file_uid: str) -> bool:
     return await run_in_threadpool(_s(request, "permissions").can_read, ident, file_uid)
 
 
+async def _live(request: Request, ident: Identity, file_uid: str) -> bool:
+    return await run_in_threadpool(_s(request, "permissions").is_live, ident, file_uid)
+
+
 @router.get("/dashboard/attention")
 async def attention(request: Request, limit: int = Query(50, ge=1, le=200),
                     unread: bool = Query(False), ident: Identity = Depends(identity)) -> dict:
     rows = await run_in_threadpool(partial(
         _s(request, "notifications").list_for, ident.tenant, ident.user,
         limit=limit, unread_only=unread))
-    # Re-check READ per row (over-fetch → filter), so a lost-access item disappears.
+    # Re-check READ per row (over-fetch → filter), so a lost-access item disappears,
+    # and drop items whose anchor file is soft-deleted (same guard as the activity
+    # feed) — a trashed document must not surface in any dashboard feed.
     out = []
     for r in rows:
-        if await _readable(request, ident, r["file_uid"]):
+        if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
             out.append(r)
     return {"items": out}
 
@@ -56,12 +63,15 @@ async def mark_seen(notification_id: int, request: Request,
 @router.get("/dashboard/activity")
 async def activity(request: Request, limit: int = Query(50, ge=1, le=200),
                    ident: Identity = Depends(identity)) -> dict:
-    # Over-fetch then ACL-filter so the returned page is all readable to the caller.
+    # Over-fetch then filter so the returned page is all readable AND live to the
+    # caller: drop rows the caller can't READ, and drop soft-deleted files (an item
+    # deleted before its file.deleted event was pruned, or recorded pre-fix). The
+    # cheap cached READ check runs first; is_live only for rows that survive it.
     rows = await run_in_threadpool(partial(
         _s(request, "activity").recent, ident.tenant, limit=limit * 4))
     out = []
     for r in rows:
-        if await _readable(request, ident, r["file_uid"]):
+        if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
             out.append(r)
             if len(out) >= limit:
                 break

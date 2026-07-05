@@ -68,6 +68,33 @@ class Permissions:
     def can_write(self, identity: Identity, file_uid: str) -> bool:
         return self.check(identity, file_uid, "w")
 
+    def is_live(self, identity: Identity, file_uid: str) -> bool:
+        """True if the file still exists and is NOT soft-deleted, checked as the end
+        user. The core's ``Exists`` RPC filters soft-deleted rows (``get_file_by_uid``
+        selects ``… AND deleted = FALSE``), so a trashed file returns False. Used as a
+        read-time guard on projection feeds (dashboard activity) so an item deleted
+        before its ``file.deleted`` event was pruned — or recorded before that pruning
+        shipped — still drops out. Uncached (deletion must reflect promptly) and
+        fail-closed: any error → False (exclude)."""
+        if not file_uid:
+            return False
+        from .core_client import client_for
+        try:
+            mf = client_for(identity, self.config)
+        except Exception:
+            log.warning("is_live: could not build core client", exc_info=True)
+            return False
+        try:
+            return bool(mf.entity_exists(file_uid))
+        except Exception:
+            log.warning("is_live check failed for %s", file_uid, exc_info=True)
+            return False
+        finally:
+            try:
+                mf.close()
+            except Exception:
+                pass
+
     # -- event-driven invalidation (called by the consumer, M4a) -------------
     def invalidate_resource(self, tenant: str, file_uid: str) -> None:
         with self._lock:

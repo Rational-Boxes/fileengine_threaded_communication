@@ -62,10 +62,10 @@ def make(monkeypatch):
     monkeypatch.setattr("discussion.api.authenticate", _fake_auth)
     monkeypatch.setattr("discussion.http_auth.authenticate", _fake_auth)
 
-    def _make(*, reads=True, notes=None, activity=None, store=None, reviews=None):
+    def _make(*, reads=True, live=True, notes=None, activity=None, store=None, reviews=None):
         notes = FakeNotes(notes or [])
         store = FakeStoreD(**(store or {}))
-        app = build_app(Config(), permissions=FakePerms(reads=reads), notifications=notes,
+        app = build_app(Config(), permissions=FakePerms(reads=reads, live=live), notifications=notes,
                         activity=FakeActivity(activity or []), store=store,
                         reviews=FakeReviewsD(reviews or {}))
         return Ctx(TestClient(app), notes, store)
@@ -78,6 +78,18 @@ def test_attention_feed_is_acl_filtered(make):
             {"id": 2, "user_id": "bob", "kind": "reply", "file_uid": "f2", "thread_id": "t2",
              "review_id": None, "actor": "carol", "created_at": "t", "read_at": None}]
     c = make(reads={"f1"}, notes=rows)   # only f1 readable
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert [i["id"] for i in items] == [1]
+
+
+def test_attention_feed_excludes_deleted(make):
+    # Both readable, but f2 is soft-deleted → its notification must not surface
+    # (same live guard as the activity feed).
+    rows = [{"id": 1, "user_id": "bob", "kind": "mention", "file_uid": "f1", "thread_id": "t1",
+             "review_id": None, "actor": "carol", "created_at": "t", "read_at": None},
+            {"id": 2, "user_id": "bob", "kind": "reply", "file_uid": "f2", "thread_id": "t2",
+             "review_id": None, "actor": "carol", "created_at": "t", "read_at": None}]
+    c = make(reads=True, live={"f1"}, notes=rows)   # f2 not live (deleted)
     items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
     assert [i["id"] for i in items] == [1]
 
@@ -98,6 +110,18 @@ def test_activity_feed_is_acl_filtered(make):
             {"id": 2, "file_uid": "fX", "event_type": "created", "version": "", "name": "b",
              "path": "/b", "actor": "carol", "ts": "t"}]
     c = make(reads={"f1"}, activity=rows)
+    items = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"]
+    assert [i["file_uid"] for i in items] == ["f1"]
+
+
+def test_activity_feed_excludes_deleted(make):
+    # Both readable, but f2 is soft-deleted → it must not appear even though a stale
+    # activity row still references it (read-time is_live guard).
+    rows = [{"id": 1, "file_uid": "f1", "event_type": "updated", "version": "v2", "name": "a",
+             "path": "/a", "actor": "carol", "ts": "t"},
+            {"id": 2, "file_uid": "f2", "event_type": "created", "version": "", "name": "b",
+             "path": "/b", "actor": "carol", "ts": "t"}]
+    c = make(reads=True, live={"f1"}, activity=rows)   # f2 not live (deleted)
     items = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"]
     assert [i["file_uid"] for i in items] == ["f1"]
 

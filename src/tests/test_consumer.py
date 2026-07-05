@@ -5,10 +5,15 @@ from discussion.consumer import EventConsumer
 class FakeActivity:
     def __init__(self):
         self.records = []
+        self.deleted = []
 
     def record(self, tenant, *, event_type, file_uid, version="", name="", path="", actor=""):
         self.records.append({"tenant": tenant, "event_type": event_type, "file_uid": file_uid,
                              "version": version})
+
+    def delete_for_file(self, tenant, file_uid):
+        self.deleted.append((tenant, file_uid))
+        return 1
 
 
 class FakeStore:
@@ -51,6 +56,13 @@ def test_file_updated_records_and_marks_stale():
     c.handle({"type": "file.updated", "tenant": "t1", "file_uid": "f1", "version": "v2"})
     assert a.records[0]["event_type"] == "updated"
     assert s.stale == [("t1", "f1", "v2")]
+
+
+def test_file_deleted_prunes_activity():
+    c, a, s, p = _mk()
+    c.handle({"type": "file.deleted", "tenant": "t1", "file_uid": "f1"})
+    assert a.deleted == [("t1", "f1")]
+    assert a.records == []
 
 
 def test_rendition_events_ignored():
