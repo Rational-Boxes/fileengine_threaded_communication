@@ -45,21 +45,25 @@ CREATE TABLE IF NOT EXISTS "{schema}".threads (
 CREATE INDEX IF NOT EXISTS idx_threads_file ON "{schema}".threads (file_uid, status);
 
 CREATE TABLE IF NOT EXISTS "{schema}".comments (
-    id              TEXT PRIMARY KEY,
-    thread_id       TEXT NOT NULL REFERENCES "{schema}".threads (id) ON DELETE CASCADE,
-    author          TEXT NOT NULL,
-    body            TEXT NOT NULL,                  -- Markdown, constrained subset (§4a)
-    body_text       TEXT NOT NULL DEFAULT '',       -- plaintext projection for FTS + embeddings
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    edited_at       TIMESTAMPTZ,
-    deleted         BOOLEAN NOT NULL DEFAULT false, -- author soft-delete
-    redacted        BOOLEAN NOT NULL DEFAULT false, -- admin moderation (§5b)
-    redacted_by     TEXT,
-    redacted_at     TIMESTAMPTZ,
-    redacted_reason TEXT,
-    fts             tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
+    id                TEXT PRIMARY KEY,
+    thread_id         TEXT NOT NULL REFERENCES "{schema}".threads (id) ON DELETE CASCADE,
+    parent_comment_id TEXT REFERENCES "{schema}".comments (id) ON DELETE CASCADE,  -- nested replies
+    author            TEXT NOT NULL,
+    body              TEXT NOT NULL,                  -- Markdown, constrained subset (§4a)
+    body_text         TEXT NOT NULL DEFAULT '',       -- plaintext projection for FTS + embeddings
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    edited_at         TIMESTAMPTZ,
+    deleted           BOOLEAN NOT NULL DEFAULT false, -- author soft-delete
+    redacted          BOOLEAN NOT NULL DEFAULT false, -- admin moderation (§5b)
+    redacted_by       TEXT,
+    redacted_at       TIMESTAMPTZ,
+    redacted_reason   TEXT,
+    fts               tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
+-- Self-heal existing tenants provisioned before nested replies were added.
+ALTER TABLE "{schema}".comments ADD COLUMN IF NOT EXISTS parent_comment_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON "{schema}".comments (thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_comments_parent ON "{schema}".comments (parent_comment_id);
 CREATE INDEX IF NOT EXISTS idx_comments_fts ON "{schema}".comments USING gin (fts);
 
 CREATE TABLE IF NOT EXISTS "{schema}".comment_revisions (

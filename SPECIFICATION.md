@@ -153,21 +153,26 @@ CREATE TABLE threads (
 CREATE INDEX idx_threads_file ON threads (file_uid, status);
 
 CREATE TABLE comments (
-    id            TEXT PRIMARY KEY,
-    thread_id     TEXT NOT NULL REFERENCES threads (id) ON DELETE CASCADE,
-    author        TEXT NOT NULL,
-    body          TEXT NOT NULL,                  -- Markdown, constrained subset (see §4a)
-    body_text     TEXT NOT NULL DEFAULT '',       -- plaintext projection (markup stripped) for FTS + embeddings
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    edited_at     TIMESTAMPTZ,                    -- edits allowed only by the author; original kept in comment_revisions
-    deleted       BOOLEAN NOT NULL DEFAULT false, -- author soft-delete; body tombstoned, audit retained
-    redacted      BOOLEAN NOT NULL DEFAULT false, -- admin moderation (§5b): display masked, original moved to redactions
-    redacted_by   TEXT,
-    redacted_at   TIMESTAMPTZ,
-    redacted_reason TEXT,
-    fts           tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
+    id                TEXT PRIMARY KEY,
+    thread_id         TEXT NOT NULL REFERENCES threads (id) ON DELETE CASCADE,
+    -- Nested (Facebook-style) replies to unlimited depth: a reply points at its
+    -- parent comment; a top-level comment (the thread's own) has NULL. The tree is
+    -- built from these edges; visual indentation is capped in the UI.
+    parent_comment_id TEXT REFERENCES comments (id) ON DELETE CASCADE,
+    author            TEXT NOT NULL,
+    body              TEXT NOT NULL,                  -- Markdown, constrained subset (see §4a)
+    body_text         TEXT NOT NULL DEFAULT '',       -- plaintext projection (markup stripped) for FTS + embeddings
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    edited_at         TIMESTAMPTZ,                    -- author edits keep prior bodies in comment_revisions
+    deleted           BOOLEAN NOT NULL DEFAULT false, -- author soft-delete; body tombstoned, audit retained
+    redacted          BOOLEAN NOT NULL DEFAULT false, -- admin moderation (§5b): display masked, original moved to redactions
+    redacted_by       TEXT,
+    redacted_at       TIMESTAMPTZ,
+    redacted_reason   TEXT,
+    fts               tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
 CREATE INDEX idx_comments_thread ON comments (thread_id, created_at);
+CREATE INDEX idx_comments_parent ON comments (parent_comment_id);
 CREATE INDEX idx_comments_fts ON comments USING gin (fts);
 
 CREATE TABLE comment_revisions (            -- immutable edit history (substrate = versioned)
@@ -500,14 +505,16 @@ GET    /healthz  /readyz                      # liveness/readiness (loopback-bin
 POST   /auth/token                            # LDAP-bind → service bearer (fallback auth)
 GET    /whoami
 
-# Threads on a document
+# Threads on a document (Facebook-style: a thread is a top-level comment + a tree of replies)
 GET    /files/{file_uid}/threads              # ?version= ?status=open|resolved ; READ-gated
-POST   /files/{file_uid}/threads              # open a thread {version?, title, body}  (region: V2)
-GET    /threads/{id}                          # thread + comments (re-checks READ)
-POST   /threads/{id}/comments                 # reply {body, mentions:[email]}  (validate READ per target, error-mark: §5.1)
+POST   /files/{file_uid}/threads              # open a thread {version?, title, body, reviewers?[]}  (region: V2)
+GET    /threads/{id}                          # thread + full comment tree (re-checks READ)
+POST   /threads/{id}/comments                 # reply {body, parent_comment_id?, mentions:[email]}  (nested; §5.1)
+GET    /files/{file_uid}/mentionable?q=       # @mention autocomplete — users who can READ this file (§5.1)
 WS     /files/{file_uid}/live                  # live comment sync while the panel is open (?token=, §10h)
 PATCH  /threads/{id}                          # resolve/reopen {status, resolved_version?}  (opener|WRITE|reviewer)
-PATCH  /comments/{id}                         # edit own comment (versioned)
+PATCH  /comments/{id}                         # edit own comment (new revision)
+GET    /comments/{id}/revisions               # prior revisions of an edited comment (author/READ)
 DELETE /comments/{id}                         # soft-delete own comment
 POST   /comments/{id}/redact                  # tenant-admin only: mask + de-index; original → redactions {reason} (§5b)
 
@@ -1023,12 +1030,25 @@ reusing the same builder.
 13. **Dashboard refresh (§10a):** the dashboard feeds and metrics refresh on a **~30 s focused poll**
    (configurable, paused when hidden) — current numbers without a push surface. Poll, not push; the
    live channel is the open panel only (§10h).
+14. **Facebook-style nested comments (§4/§9):** a thread is a **top-level comment + an unlimited-depth
+   tree of replies** (`comments.parent_comment_id`). Reply to *any* comment; the UI renders the tree
+   (capping visual indentation), edits and deletes apply to individual nodes, and a deleted/redacted
+   parent keeps its replies visible beneath a tombstone.
+15. **Edit own comment + history (§9):** an author edits their own comment as a **new revision**
+   (`comment_revisions`), shown with an "edited" marker; `GET /comments/{id}/revisions` exposes the
+   prior versions to the author (READ-gated).
+16. **@mention autocomplete (§5.1):** typing `@` suggests users via
+   `GET /files/{uid}/mentionable?q=`, which returns only people who can **READ** the file — the
+   promotion of the previously-V2 "who-can-read" discovery into v1. Submit-time validation (#4) stays
+   as the backstop for hand-typed addresses.
+17. **Review request from a top-level comment (§9):** opening a thread may name **reviewers**
+   (`POST /files/{uid}/threads {reviewers?}` → linked `review_requests`); that top-level comment reads
+   as the review request, and the nested replies are the review **dialog** beneath it. Resolve/status
+   (#3) still governs the thread.
 
 **Deferred to a V2 specification:**
 - **In-document / entity anchoring (§1):** pinning a thread to a sub-document region — IFC/BIM
   element GUID, PDF page/rect, point-cloud/LAS bbox, drawing coordinate — with per-viewer coordinate
   models and picking/overlay interaction. The v1 anchor `(file_uid, version?)` extends to it additively.
-- **Mention target discovery (§5.1):** an eligible-user picker driven by a "who-can-read(`file_uid`)"
-  lookup, as an ergonomic upgrade over v1's address-anything-then-validate-on-submit.
 
 No v1-blocking questions remain open.

@@ -47,7 +47,7 @@ def _comment_select(prefix: str = "") -> str:
     callers see the flags and an empty body, never the original text."""
     p = prefix
     return (
-        f"{p}id, {p}thread_id, {p}author, "
+        f"{p}id, {p}thread_id, {p}parent_comment_id, {p}author, "
         f"CASE WHEN {p}deleted THEN '' WHEN {p}redacted THEN '' ELSE {p}body END AS body, "
         f"{p}created_at, {p}edited_at, {p}deleted, {p}redacted, {p}redacted_by, {p}redacted_reason"
     )
