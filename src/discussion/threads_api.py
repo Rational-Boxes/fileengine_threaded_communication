@@ -89,6 +89,39 @@ async def _live(request: Request, tenant: str, file_uid: str, message: dict) -> 
         pass
 
 
+async def _validate_mentions(request: Request, file_uid: str, mentions):
+    """Resolve + READ-check each mention target; 422 if any lack access (§5.1).
+    Returns the list of valid ``(identifier, principal)`` for persistence."""
+    if not mentions:
+        return []
+    valid, invalid = await run_in_threadpool(
+        validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid, mentions)
+    if invalid:
+        raise HTTPException(status_code=422,
+                            detail={"error": "some mentioned users cannot access this file",
+                                    "invalid_mentions": invalid})
+    return valid
+
+
+async def _persist_mentions(request: Request, ident: Identity, *, file_uid: str, thread_id: str,
+                            comment_id: str, valid) -> set:
+    """Store mentions + notify + emit for the validated targets. Returns the uids."""
+    events = _s(request, "events")
+    mentioned = set()
+    for _id, principal in valid:
+        uid = principal.user
+        mentioned.add(uid)
+        await run_in_threadpool(partial(
+            _s(request, "store").add_mention, ident.tenant, comment_id=comment_id,
+            thread_id=thread_id, target_user=uid))
+        await run_in_threadpool(partial(
+            _s(request, "notifications").add, ident.tenant, user_id=uid, kind="mention",
+            file_uid=file_uid, actor=ident.user, thread_id=thread_id))
+        events.publish("mention.created", tenant=ident.tenant, file_uid=file_uid,
+                       actor=ident.user, thread_id=thread_id, target_user=uid)
+    return mentioned
+
+
 # ------------------------------ threads ------------------------------------
 @router.get("/files/{file_uid}/threads")
 async def list_threads(file_uid: str, request: Request,
@@ -107,6 +140,9 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
     text = _clean_body(request, (body or {}).get("body"))
     version = ((body or {}).get("version") or "").strip()
     title = ((body or {}).get("title") or "").strip()
+    # Validate the opening comment's mentions *before* creating the thread (§5.1).
+    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
+
     thread = await run_in_threadpool(partial(
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
         title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user))
@@ -114,6 +150,8 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
         first = thread["comments"][0]
         await _index(request, ident.tenant, comment_id=first["id"],
                      file_uid=file_uid, thread_id=thread["id"], text=to_plaintext(text))
+        await _persist_mentions(request, ident, file_uid=file_uid, thread_id=thread["id"],
+                                comment_id=first["id"], valid=valid)
         await _live(request, ident.tenant, file_uid,
                     {"type": "comment", "action": "created", "thread_id": thread["id"],
                      "comment": first})
@@ -213,15 +251,7 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
 
     # Validate mentions *before* writing (§5.1): any target lacking READ error-marks
     # the whole submit so the author can fix and resubmit — no partial mention.
-    mentions = (body or {}).get("mentions") or []
-    valid = []
-    if mentions:
-        valid, invalid = await run_in_threadpool(
-            validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid, mentions)
-        if invalid:
-            raise HTTPException(status_code=422,
-                                detail={"error": "some mentioned users cannot access this file",
-                                        "invalid_mentions": invalid})
+    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
 
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
@@ -232,18 +262,8 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
                 {"type": "comment", "action": "created", "thread_id": thread_id, "comment": comment})
 
     events = _s(request, "events")
-    mentioned_uids = set()
-    for _id, principal in valid:
-        uid = principal.user
-        mentioned_uids.add(uid)
-        await run_in_threadpool(partial(
-            store.add_mention, ident.tenant, comment_id=comment["id"], thread_id=thread_id,
-            target_user=uid))
-        await run_in_threadpool(partial(
-            _s(request, "notifications").add, ident.tenant, user_id=uid, kind="mention",
-            file_uid=file_uid, actor=ident.user, thread_id=thread_id))
-        events.publish("mention.created", tenant=ident.tenant, file_uid=file_uid,
-                       actor=ident.user, thread_id=thread_id, target_user=uid)
+    mentioned_uids = await _persist_mentions(request, ident, file_uid=file_uid, thread_id=thread_id,
+                                             comment_id=comment["id"], valid=valid)
 
     # Reply notifications to other participants (not the author, not just-mentioned).
     participants = await run_in_threadpool(store.thread_participants, ident.tenant, thread_id)
