@@ -50,7 +50,9 @@ class LiveHub:
         self.config = config
         self.perms = permissions
         self.bridge = bridge          # optional cross-replica publisher (Redis pub/sub)
-        self._subs: dict[tuple[str, str], set[Connection]] = defaultdict(set)
+        # Insertion-ordered set of connections per file (dict keys) so the presence
+        # roster is deterministic (join order), not hash-order.
+        self._subs: dict[tuple[str, str], dict[Connection, None]] = defaultdict(dict)
         self._count = 0
 
     @staticmethod
@@ -69,7 +71,7 @@ class LiveHub:
         return seen
 
     async def join(self, conn: Connection) -> None:
-        self._subs[self._key(conn.tenant, conn.file_uid)].add(conn)
+        self._subs[self._key(conn.tenant, conn.file_uid)][conn] = None
         self._count += 1
         await self._send_presence(conn.tenant, conn.file_uid)
 
@@ -78,7 +80,7 @@ class LiveHub:
         subs = self._subs.get(key)
         if not subs or conn not in subs:
             return
-        subs.discard(conn)
+        subs.pop(conn, None)
         self._count -= 1
         if not subs:
             self._subs.pop(key, None)

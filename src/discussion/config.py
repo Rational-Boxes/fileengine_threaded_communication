@@ -152,7 +152,15 @@ class Config:
         # --- Email digest (§11 / M6) ---
         self.digest_enabled = _bool("DISC_DIGEST_ENABLED", True)
         self.digest_default_cadence = _env("DISC_DIGEST_DEFAULT_CADENCE", "off")
+        self.digest_batch_size = _int("DISC_DIGEST_BATCH_SIZE", 200)
+        self.digest_send_now_ratelimit_s = _int("DISC_DIGEST_SEND_NOW_RATELIMIT_S", 600)
+        self.ai_summary_enabled = _bool("DISC_AI_SUMMARY_ENABLED", False)
         self.spa_base_url = _env("DISC_SPA_BASE_URL", "")
+        self.smtp_host = _env("DISC_SMTP_HOST", "")
+        self.smtp_port = _int("DISC_SMTP_PORT", 587)
+        self.smtp_user = _env("DISC_SMTP_USER", "")
+        self.smtp_password = _env("DISC_SMTP_PASSWORD", "")
+        self.digest_from = _env("DISC_DIGEST_FROM", "")
 
         # --- Audit (redaction / invisible-viewing trail, §5b/§10h) ---
         self.audit_log_file = _env("DISC_AUDIT_LOG_FILE", "")

@@ -22,12 +22,16 @@ from .api import router
 from .bridge_auth import BridgeTokenVerifier
 from .config import Config
 from .dashboard_api import router as dashboard_router
+from .digest import DigestSender
+from .digest_api import router as digest_router
+from .digest_store import DigestStore
 from .directory import Directory
 from .embeddings import build_embedder
 from .events import EventPublisher
 from .indexing import Indexer
 from .live import LiveHub
 from .live_api import router as live_router
+from .mailer import SmtpMailer
 from .notifications import NotificationStore
 from .permissions import Permissions
 from .reviews_api import router as reviews_router
@@ -48,7 +52,8 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
               notifications: NotificationStore | None = None,
               reviews: ReviewStore | None = None, indexer: Indexer | None = None,
               searcher: Searcher | None = None, activity: ActivityStore | None = None,
-              live: LiveHub | None = None) -> FastAPI:
+              live: LiveHub | None = None, digest_store: DigestStore | None = None,
+              digest_sender: DigestSender | None = None) -> FastAPI:
     config = config or Config()
     audit.configure(config.audit_log_file)
     app = FastAPI(title="discussion", version=__version__)
@@ -87,6 +92,13 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     # Live comment sync + presence (M4b, §10h): in-process hub (cross-replica bridge
     # wired separately). Shares the cached permission checker for per-push ACL re-checks.
     app.state.live = live or LiveHub(config, app.state.permissions)
+    # Email digest (M6): subscription store + on-demand sender (the hourly cron
+    # sender runs as a separate `discuss-digest` process; this powers /me/digest).
+    app.state.digest_store = digest_store or DigestStore(config)
+    app.state.digest_sender = digest_sender or DigestSender(
+        config, digest_store=app.state.digest_store, notifications=app.state.notifications,
+        activity=app.state.activity, permissions=app.state.permissions,
+        directory=app.state.directory, mailer=SmtpMailer(config))
 
     app.include_router(router)
     app.include_router(threads_router)
@@ -94,6 +106,7 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     app.include_router(search_router)
     app.include_router(dashboard_router)
     app.include_router(live_router)
+    app.include_router(digest_router)
     return app
 
 

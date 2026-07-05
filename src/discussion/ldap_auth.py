@@ -20,6 +20,7 @@ class Identity:
     roles: List[str] = field(default_factory=list)
     tenant: str = "default"
     authenticated: bool = False
+    email: str = ""
 
     @property
     def is_admin(self) -> bool:

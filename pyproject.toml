@@ -29,7 +29,7 @@ mcp = ["mcp>=1.0"]
 discussion = "discussion.app:main"
 discuss-consumer = "discussion.consumer:main"   # core-event consumer (§8 / M4a)
 discuss-mcp-http = "discussion.mcp_server:main_http"   # MCP door (§7 / M5)
-# discuss-digest = "discussion.digest:main"     # added in M6 (§11c)
+discuss-digest = "discussion.digest:main"       # hourly email-digest sender (§11c / M6)
 
 [build-system]
 requires = ["setuptools>=61"]

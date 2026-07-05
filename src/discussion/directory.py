@@ -40,12 +40,14 @@ class Directory:
         try:
             # Address by uid OR email — the author may type either (§5.1).
             svc.search(cfg.ldap_user_base, f"(|(uid={identifier})(mail={identifier}))",
-                       search_scope=SUBTREE, attributes=["uid", "cn"])
+                       search_scope=SUBTREE, attributes=["uid", "cn", "mail"])
             if not svc.entries:
                 return None
             entry = svc.entries[0]
             user_dn = entry.entry_dn
             uid = str(entry.uid) if "uid" in entry else identifier
+            email = str(entry.mail) if "mail" in entry and entry.mail else (
+                identifier if "@" in identifier else "")
 
             roles: list[str] = []
             svc.search(cfg.ldap_tenant_base,
@@ -58,7 +60,7 @@ class Directory:
             if "administrators" in roles and "system_admin" not in roles:
                 roles.append("system_admin")
 
-            return Identity(user=uid, roles=roles, tenant=cfg.tenant, authenticated=False)
+            return Identity(user=uid, roles=roles, tenant=cfg.tenant, authenticated=False, email=email)
         except LDAPException:
             log.warning("directory: lookup failed for %s", identifier, exc_info=True)
             return None

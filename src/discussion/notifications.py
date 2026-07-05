@@ -41,13 +41,17 @@ class NotificationStore:
             conn.close()
 
     def list_for(self, tenant: str, user: str, *, limit: int = 50,
-                 unread_only: bool = False) -> list[dict]:
-        """The caller's attention feed (§10a). The handler re-checks READ per row."""
+                 unread_only: bool = False, since: Optional[str] = None) -> list[dict]:
+        """The caller's attention feed (§10a) / digest window (§11b). The handler
+        re-checks READ per row."""
         sql = ("SELECT id, kind, file_uid, thread_id, review_id, actor, created_at, read_at "
                "FROM notifications WHERE user_id = %s")
         params: list = [user]
         if unread_only:
             sql += " AND read_at IS NULL"
+        if since:
+            sql += " AND created_at > %s"
+            params.append(since)
         sql += " ORDER BY created_at DESC LIMIT %s"
         params.append(limit)
         conn = connect_for_tenant(self.config, tenant, readonly=True)

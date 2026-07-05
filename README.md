@@ -50,7 +50,15 @@ nothing merges to `main` until the service is complete.
   ContextVar; same ACL + mention-safety as REST, §5/§5.1). `discussion_thread`
   provenance descriptor + `GET /threads/{id}/provenance` (permalink, participants,
   resolving-version link, §12).
-- **M6** — email digest + `discuss-digest` cron sender — follows.
+- **M6 — email digest + cron sender** ✓ per-user subscription (`/me/digest` GET/PUT,
+  `send-now`); the hourly `discuss-digest` sender self-selects due users by cadence
+  (`off`/`hourly`/`daily`/`weekly`, timezone-aware), builds each digest **as the
+  recipient** (ACL-filtered), **idempotent per period** (`UNIQUE(user_id, period_key)`)
+  with an advisory run-lock, `quiet_if_empty`, best-effort SMTP (§11). Deployment
+  schedule (cron/systemd-timer/Ansible) lives in the scripts repo.
+
+**Backend milestones M0–M6 complete.** Remaining: frontend polish (file-list badges,
+review UI) on `feature/discussion-threads-ui`; deployment wiring in the scripts repo.
 
 ## Layout
 
