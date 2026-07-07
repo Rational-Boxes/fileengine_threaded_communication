@@ -89,6 +89,21 @@ class ReviewStore:
                 (user, list(file_uids)))
             return {r[0]: int(r[1]) for r in cur.fetchall()}
 
+    def list_for_file(self, tenant: str, file_uid: str, *,
+                      status: Optional[str] = None) -> list[dict]:
+        """Every review request raised on a file — the review record for the anchor,
+        regardless of who requested or was assigned. READ on the file is enforced by
+        the caller (reviews_api). Newest first."""
+        where = "file_uid = %(f)s"
+        params = {"f": file_uid}
+        if status:
+            where += " AND status = %(s)s"
+            params["s"] = status
+        with self._conn(tenant, readonly=True) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT {_COLS} FROM review_requests WHERE {where} "
+                        "ORDER BY created_at DESC", params)
+            return _rows(cur)
+
     def list_for(self, tenant: str, user: str, *, role: str = "both",
                  status: Optional[str] = None) -> list[dict]:
         """Reviews where ``user`` is the reviewer and/or the requester."""
