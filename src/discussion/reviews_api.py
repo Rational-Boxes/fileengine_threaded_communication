@@ -1,6 +1,7 @@
 """Review-request HTTP surface (SPECIFICATION §9 / M2).
 
   POST /files/{file_uid}/reviews   raise a review {reviewers:[email], version?, thread_id?} (READ)
+  GET  /files/{file_uid}/reviews   the review record for a file — all requests (READ)
   POST /reviews/{id}/acknowledge   reviewer acks → requester notified
   POST /reviews/{id}/complete      reviewer completes {outcome} → requester notified
   GET  /reviews?role=&status=      the caller's reviews (as requester and/or reviewer)
@@ -58,6 +59,21 @@ async def raise_review(file_uid: str, request: Request, body: dict = Body(...),
             file_uid=file_uid, actor=ident.user, thread_id=thread_id, review_id=r["id"]))
         events.publish("review.requested", tenant=ident.tenant, file_uid=file_uid,
                        actor=ident.user, review_id=r["id"], target_user=r["reviewer"])
+    return {"reviews": reviews}
+
+
+@router.get("/files/{file_uid}/reviews")
+async def list_file_reviews(file_uid: str, request: Request,
+                            status: str | None = Query(
+                                None, pattern="^(requested|acknowledged|completed|declined)$"),
+                            ident: Identity = Depends(identity)) -> dict:
+    """The review record for the anchor — every request raised on the file, whoever
+    asked or was assigned. Visible to anyone who can READ the file (the record is
+    part of the document, like its comments)."""
+    if not await run_in_threadpool(_s(request, "permissions").can_read, ident, file_uid):
+        raise HTTPException(status_code=403, detail="permission denied")
+    reviews = await run_in_threadpool(partial(
+        _s(request, "reviews").list_for_file, ident.tenant, file_uid, status=status))
     return {"reviews": reviews}
 
 

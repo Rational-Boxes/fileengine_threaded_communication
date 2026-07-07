@@ -51,6 +51,10 @@ class FakeReviewStore:
                 out.append(dict(r))
         return out
 
+    def list_for_file(self, tenant, file_uid, *, status=None):
+        return [dict(r) for r in self.rows.values()
+                if r["file_uid"] == file_uid and (status is None or r["status"] == status)]
+
 
 class Ctx:
     def __init__(self, client, reviews, notes, events):
@@ -87,6 +91,23 @@ def test_raise_review_requires_read_on_file(make):
     c = make(reads=None)
     assert c.client.post("/files/f1/reviews", json={"reviewers": ["carol@x"]},
                          headers=_auth("bob")).status_code == 403
+
+
+def test_list_file_reviews_returns_the_record_for_the_file(make):
+    c = make(reads=True)
+    c.client.post("/files/f1/reviews", json={"reviewers": ["carol@x"]}, headers=_auth("bob"))
+    # A reader who is neither requester nor reviewer still sees the file's record.
+    r = c.client.get("/files/f1/reviews", headers=_auth("admin"))
+    assert r.status_code == 200
+    reviews = r.json()["reviews"]
+    assert len(reviews) == 1 and reviews[0]["file_uid"] == "f1" and reviews[0]["requester"] == "bob"
+    # A different file has no record.
+    assert c.client.get("/files/fX/reviews", headers=_auth("admin")).json()["reviews"] == []
+
+
+def test_list_file_reviews_requires_read(make):
+    c = make(reads=None)
+    assert c.client.get("/files/f1/reviews", headers=_auth("admin")).status_code == 403
 
 
 def test_raise_review_error_marks_reviewer_without_access(make):
