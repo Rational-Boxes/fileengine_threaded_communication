@@ -2,7 +2,7 @@
 name = "discussion-threaded-communication"
 version = "0.1.0"
 description = "FileEngine document-anchored threaded discussion & review service (permission-gated)"
-license = {text = "GPL-3.0-or-later"}
+license = {text = "AGPL-3.0-or-later"}
 authors = [{name = "James Hickman", email = "james@rationalboxes.com"}]
 requires-python = ">=3.10"
 dependencies = [
