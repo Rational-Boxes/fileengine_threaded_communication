@@ -58,6 +58,23 @@ def build_app(config: Config | None = None, *, token_store: TokenStore | None = 
     audit.configure(config.audit_log_file)
     app = FastAPI(title="discussion", version=__version__)
 
+    # Route-scoped IP allowlist for the unauthenticated monitoring endpoints
+    # (security review L2). Endpoints already bind loopback; when
+    # FILEENGINE_MONITORING_ALLOW_IPS is set (comma-separated client IPs), a
+    # monitoring request from a non-listed address is refused with 403.
+    import os as _os
+    from fastapi.responses import JSONResponse as _JSONResponse
+    _monitor_allow = {ip.strip() for ip in
+                      _os.environ.get("FILEENGINE_MONITORING_ALLOW_IPS", "").split(",") if ip.strip()}
+
+    @app.middleware("http")
+    async def _guard_monitoring(request, call_next):
+        if _monitor_allow and request.url.path in {"/healthz", "/readyz", "/poolz"}:
+            client = request.client.host if request.client else ""
+            if client not in _monitor_allow:
+                return _JSONResponse({"error": "forbidden"}, status_code=403)
+        return await call_next(request)
+
     # Browser CORS for a SPA on another origin (off unless DISC_CORS_ORIGINS set).
     # Explicit origins (never "*") so credentialed bearer + X-Tenant requests work.
     if config.cors_origins:
