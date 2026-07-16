@@ -12,7 +12,14 @@ never with an ACL bypass — per the impersonation rule, SPECIFICATION §5).
 ``fileengine`` is imported lazily here so config/auth/health import without the
 gRPC stack; import this module only where a core call is actually made (M1+).
 """
+import contextvars
+
 from .ldap_auth import Identity, authenticate
+
+# Request-scoped client IP (set by the HTTP middleware), forwarded to the core so
+# per-user audit rows carry the caller's address. Empty for background work.
+request_source_addr: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "request_source_addr", default="")
 
 
 def client_for(identity: Identity, config):
@@ -23,6 +30,7 @@ def client_for(identity: Identity, config):
         user_name=identity.user,
         user_roles=identity.roles,
         tenant=identity.tenant or config.tenant,
+        source_addr=request_source_addr.get(),  # forwarded to the core for audit
     )
 
 
