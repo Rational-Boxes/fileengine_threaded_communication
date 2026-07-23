@@ -140,24 +140,30 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
     text = _clean_body(request, (body or {}).get("body"))
     version = ((body or {}).get("version") or "").strip()
     title = ((body or {}).get("title") or "").strip()
+    # V2 (§5.4): optional viewpoint/region anchor. None = today's file-level comment.
+    # The core stays unaware; the frontend viewer for anchor.kind renders/restores it.
+    anchor = (body or {}).get("anchor") or None
     # Validate the opening comment's mentions *before* creating the thread (§5.1).
     valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
 
     thread = await run_in_threadpool(partial(
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
-        title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user))
+        title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user,
+        anchor=anchor))
     if thread.get("comments"):
         first = thread["comments"][0]
         await _index(request, ident.tenant, comment_id=first["id"],
                      file_uid=file_uid, thread_id=thread["id"], text=to_plaintext(text))
         await _persist_mentions(request, ident, file_uid=file_uid, thread_id=thread["id"],
                                 comment_id=first["id"], valid=valid)
+        # Carry the anchor on the live fan-out so a teammate's open 3D viewer can
+        # render the new marker in real time (§9). Null anchor = unchanged behaviour.
         await _live(request, ident.tenant, file_uid,
                     {"type": "comment", "action": "created", "thread_id": thread["id"],
-                     "comment": first})
+                     "comment": first, "anchor": thread.get("anchor")})
     events = _s(request, "events")
     events.publish("thread.opened", tenant=ident.tenant, file_uid=file_uid, actor=ident.user,
-                   thread_id=thread["id"])
+                   thread_id=thread["id"], anchor=thread.get("anchor"))
     events.publish("comment.created", tenant=ident.tenant, file_uid=file_uid, actor=ident.user,
                    thread_id=thread["id"])
     return thread
@@ -249,13 +255,18 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
         if parent_thread != thread_id:
             raise HTTPException(status_code=422, detail="parent_comment_id is not in this thread")
 
+    # V2 (§5.4): optionally pin this comment to one of the topic's viewpoints (BCF
+    # semantics). Opaque to the store; None = an ordinary, unpinned comment.
+    viewpoint_ref = (body or {}).get("viewpoint_ref") or None
+
     # Validate mentions *before* writing (§5.1): any target lacking READ error-marks
     # the whole submit so the author can fix and resubmit — no partial mention.
     valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
 
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
-        body=text, body_text=to_plaintext(text), parent_comment_id=parent_id))
+        body=text, body_text=to_plaintext(text), parent_comment_id=parent_id,
+        viewpoint_ref=viewpoint_ref))
     await _index(request, ident.tenant, comment_id=comment["id"], file_uid=file_uid,
                  thread_id=thread_id, text=to_plaintext(text))
     await _live(request, ident.tenant, file_uid,

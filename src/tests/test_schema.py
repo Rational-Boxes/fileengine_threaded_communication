@@ -37,3 +37,13 @@ def test_tenant_ddl_is_idempotent_form():
 def test_jsonb_default_literal_intact():
     # The doubled brace in the template must render to a real empty-json default.
     assert "DEFAULT '{}'" in tenant_ddl("acme")
+
+
+def test_tenant_ddl_has_v2_anchor_and_viewpoint_columns():
+    """V2 (§5.4): threads.anchor JSONB + comments.viewpoint_ref, with self-heal ALTERs."""
+    ddl = tenant_ddl("acme", dimension=768)
+    assert "anchor           JSONB" in ddl or "anchor JSONB" in ddl
+    assert "viewpoint_ref" in ddl
+    # Additive self-heal for pre-existing tenants (idempotent form).
+    assert 'ALTER TABLE "tenant_acme".threads ADD COLUMN IF NOT EXISTS anchor JSONB' in ddl
+    assert 'ALTER TABLE "tenant_acme".comments ADD COLUMN IF NOT EXISTS viewpoint_ref TEXT' in ddl

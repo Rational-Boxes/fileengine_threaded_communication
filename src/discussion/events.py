@@ -28,7 +28,7 @@ def _now_ts() -> str:
 
 def make_event(etype: str, *, tenant: str, file_uid: str = "", actor: str = "",
                thread_id: Optional[str] = None, review_id: Optional[str] = None,
-               target_user: Optional[str] = None) -> dict:
+               target_user: Optional[str] = None, anchor: Optional[dict] = None) -> dict:
     evt = {
         "event_id": uuid.uuid4().hex,
         "type": etype,
@@ -44,6 +44,10 @@ def make_event(etype: str, *, tenant: str, file_uid: str = "", actor: str = "",
         evt["review_id"] = review_id
     if target_user is not None:
         evt["target_user"] = target_user
+    # V2 (§5.4): a 3D/region anchor rides the envelope so digest / cross-channel
+    # bridges know an opened thread is an anchored annotation, not a bare comment.
+    if anchor is not None:
+        evt["anchor"] = anchor
     return evt
 
 

@@ -12,6 +12,8 @@ import datetime as _dt
 import uuid
 from typing import Optional
 
+from psycopg.types.json import Jsonb
+
 from .config import Config
 from .db import connect_for_tenant
 
@@ -38,7 +40,7 @@ def _one(cur) -> Optional[dict]:
 
 
 _THREAD_COLS = ("id, file_uid, version, title, status, resolved_by, resolved_version, "
-                "opened_by, created_at, updated_at, anchor_stale")
+                "opened_by, created_at, updated_at, anchor_stale, anchor")
 # A soft-deleted comment is tombstoned in-place (body blanked); a redacted one is
 # masked. Callers see the flags and the (empty) body, never the original text.
 def _comment_select(prefix: str = "") -> str:
@@ -49,7 +51,8 @@ def _comment_select(prefix: str = "") -> str:
     return (
         f"{p}id, {p}thread_id, {p}parent_comment_id, {p}author, "
         f"CASE WHEN {p}deleted THEN '' WHEN {p}redacted THEN '' ELSE {p}body END AS body, "
-        f"{p}created_at, {p}edited_at, {p}deleted, {p}redacted, {p}redacted_by, {p}redacted_reason"
+        f"{p}created_at, {p}edited_at, {p}deleted, {p}redacted, {p}redacted_by, {p}redacted_reason, "
+        f"{p}viewpoint_ref"
     )
 
 
@@ -65,14 +68,19 @@ class ThreadStore:
 
     # -- threads -------------------------------------------------------------
     def create_thread(self, tenant: str, *, file_uid: str, version: str, title: str,
-                      body: str, body_text: str, opened_by: str) -> dict:
-        """Open a thread and its first comment (the opening body). Returns the thread."""
+                      body: str, body_text: str, opened_by: str,
+                      anchor: Optional[dict] = None) -> dict:
+        """Open a thread and its first comment (the opening body). Returns the thread.
+
+        ``anchor`` (V2 / §5.4) is the optional discriminated-union viewpoint/region
+        anchor stored as JSONB; None keeps today's plain file-level comment."""
         tid, cid = _uid(), _uid()
         with self._conn(tenant, provision=True) as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO threads (id, file_uid, version, title, opened_by) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (tid, file_uid, version, title, opened_by))
+                "INSERT INTO threads (id, file_uid, version, title, opened_by, anchor) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (tid, file_uid, version, title, opened_by,
+                 Jsonb(anchor) if anchor is not None else None))
             cur.execute(
                 "INSERT INTO comments (id, thread_id, author, body, body_text) "
                 "VALUES (%s, %s, %s, %s, %s)",
@@ -136,13 +144,14 @@ class ThreadStore:
 
     # -- comments ------------------------------------------------------------
     def add_comment(self, tenant: str, thread_id: str, *, author: str, body: str,
-                    body_text: str, parent_comment_id: Optional[str] = None) -> dict:
+                    body_text: str, parent_comment_id: Optional[str] = None,
+                    viewpoint_ref: Optional[str] = None) -> dict:
         cid = _uid()
         with self._conn(tenant) as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO comments (id, thread_id, parent_comment_id, author, body, body_text) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (cid, thread_id, parent_comment_id, author, body, body_text))
+                "INSERT INTO comments (id, thread_id, parent_comment_id, author, body, body_text, "
+                "viewpoint_ref) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (cid, thread_id, parent_comment_id, author, body, body_text, viewpoint_ref))
             cur.execute("UPDATE threads SET updated_at = now() WHERE id = %s", (thread_id,))
             conn.commit()
         return self.get_comment(tenant, cid)

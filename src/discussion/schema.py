@@ -23,8 +23,11 @@ def schema_name(tenant: str) -> str:
 
 
 # Idempotent DDL for one tenant's tables (SPECIFICATION §4), parameterized by schema
-# name + pgvector dimension. In-document region anchoring is deferred to V2 (§1), so
-# `threads` has no region column yet — it is added additively when V2 lands.
+# name + pgvector dimension. V2 anchoring (§5.4 of the xeokit upgrade/BCF plan) has
+# landed: `threads.anchor` is the nullable JSONB viewpoint/region anchor (NULL = a
+# plain file-level comment, unchanged) and `comments.viewpoint_ref` pins a comment to
+# one of a topic's viewpoints (BCF semantics). Both are additive & nullable — no
+# migration of existing rows.
 _TENANT_DDL = '''
 CREATE SCHEMA IF NOT EXISTS "{schema}";
 
@@ -40,9 +43,12 @@ CREATE TABLE IF NOT EXISTS "{schema}".threads (
     opened_by        TEXT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    anchor_stale     BOOLEAN NOT NULL DEFAULT false
+    anchor_stale     BOOLEAN NOT NULL DEFAULT false,
+    anchor           JSONB                            -- V2 (§5.4): discriminated-union viewpoint/region anchor; NULL = plain file-level comment
 );
 CREATE INDEX IF NOT EXISTS idx_threads_file ON "{schema}".threads (file_uid, status);
+-- Self-heal tenants provisioned before the V2 anchor column landed (§5.4).
+ALTER TABLE "{schema}".threads ADD COLUMN IF NOT EXISTS anchor JSONB;
 
 CREATE TABLE IF NOT EXISTS "{schema}".comments (
     id                TEXT PRIMARY KEY,
@@ -58,10 +64,12 @@ CREATE TABLE IF NOT EXISTS "{schema}".comments (
     redacted_by       TEXT,
     redacted_at       TIMESTAMPTZ,
     redacted_reason   TEXT,
+    viewpoint_ref     TEXT,                           -- V2 (§5.4): pin this comment to a topic viewpoint (BCF); NULL = unpinned
     fts               tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
--- Self-heal existing tenants provisioned before nested replies were added.
+-- Self-heal existing tenants provisioned before nested replies / the V2 viewpoint pin.
 ALTER TABLE "{schema}".comments ADD COLUMN IF NOT EXISTS parent_comment_id TEXT;
+ALTER TABLE "{schema}".comments ADD COLUMN IF NOT EXISTS viewpoint_ref TEXT;
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON "{schema}".comments (thread_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON "{schema}".comments (parent_comment_id);
 CREATE INDEX IF NOT EXISTS idx_comments_fts ON "{schema}".comments USING gin (fts);
