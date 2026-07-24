@@ -31,14 +31,16 @@ class FakeStore:
                 "author": c["author"], "body": body,
                 "created_at": c["created_at"], "edited_at": c["edited_at"], "deleted": c["deleted"],
                 "redacted": c["redacted"], "redacted_by": c.get("redacted_by"),
-                "redacted_reason": c.get("redacted_reason")}
+                "redacted_reason": c.get("redacted_reason"),
+                "viewpoint_ref": c.get("viewpoint_ref")}
 
-    def create_thread(self, tenant, *, file_uid, version, title, body, body_text, opened_by):
+    def create_thread(self, tenant, *, file_uid, version, title, body, body_text, opened_by,
+                      anchor=None):
         tid, cid = self._id("t"), self._id("c")
         self.threads[tid] = {"id": tid, "file_uid": file_uid, "version": version, "title": title,
                              "status": "open", "resolved_by": None, "resolved_version": None,
                              "opened_by": opened_by, "created_at": "t0", "updated_at": "t0",
-                             "anchor_stale": False}
+                             "anchor_stale": False, "anchor": anchor}
         self.comments[cid] = {"id": cid, "thread_id": tid, "author": opened_by, "body": body,
                               "body_text": body_text, "created_at": "t0", "edited_at": None,
                               "deleted": False, "redacted": False, "parent_comment_id": None}
@@ -74,12 +76,14 @@ class FakeStore:
         t.update(status=status, resolved_by=resolved_by, resolved_version=resolved_version)
         return self.get_thread(tenant, thread_id)
 
-    def add_comment(self, tenant, thread_id, *, author, body, body_text, parent_comment_id=None):
+    def add_comment(self, tenant, thread_id, *, author, body, body_text, parent_comment_id=None,
+                    viewpoint_ref=None):
         cid = self._id("c")
         self.comments[cid] = {"id": cid, "thread_id": thread_id, "author": author, "body": body,
                               "body_text": body_text, "created_at": "t1", "edited_at": None,
                               "deleted": False, "redacted": False,
-                              "parent_comment_id": parent_comment_id}
+                              "parent_comment_id": parent_comment_id,
+                              "viewpoint_ref": viewpoint_ref}
         return self.get_comment(tenant, cid)
 
     def comment_parent_thread(self, tenant, comment_id):
@@ -453,3 +457,66 @@ def test_redaction_admin_only(make):
     assert [x for x in shown if x["id"] == cid][0]["body"] == ""
     # Second redact -> already redacted -> 404.
     assert c.client.post(f"/comments/{cid}/redact", json={}, headers=_auth("admin")).status_code == 404
+
+
+# ----------------------- V2 anchor / viewpoint (§5.4) ----------------------
+class FakeLive:
+    """Records live-hub broadcasts so tests can assert the 3D-marker fan-out."""
+    def __init__(self):
+        self.messages = []  # (tenant, file_uid, message)
+
+    async def broadcast(self, tenant, file_uid, message):
+        self.messages.append((tenant, file_uid, message))
+
+
+_ANCHOR = {"kind": "model-viewpoint", "schema": "fileengine.anchor.v1",
+           "viewpoint": {"perspective_camera": {}}, "marker": {"x": 1, "y": 2, "z": 3}}
+
+
+def test_open_thread_with_anchor_roundtrips_and_syncs_live(make):
+    c = make(reads=True)
+    live = FakeLive()
+    c.client.app.state.live = live
+    r = c.client.post("/files/f1/threads",
+                      json={"body": "see this clash", "anchor": _ANCHOR}, headers=_auth("bob"))
+    assert r.status_code == 201
+    assert r.json()["anchor"] == _ANCHOR                       # persisted + returned
+    # the live fan-out carries the anchor so an open 3D viewer renders the marker
+    assert any(m.get("anchor") == _ANCHOR for _, _, m in live.messages)
+    # and the envelope event surfaces it for digest / cross-channel bridges
+    opened = [e for e in c.events.published if e["type"] == "thread.opened"]
+    assert opened and opened[0].get("anchor") == _ANCHOR
+
+
+def test_open_thread_without_anchor_is_null(make):
+    """Regression: a plain comment thread has a null anchor and unchanged live shape."""
+    c = make(reads=True)
+    live = FakeLive()
+    c.client.app.state.live = live
+    r = c.client.post("/files/f1/threads", json={"body": "just a note"}, headers=_auth("bob"))
+    assert r.status_code == 201
+    assert r.json()["anchor"] is None
+    assert all(m.get("anchor") is None for _, _, m in live.messages)
+    opened = [e for e in c.events.published if e["type"] == "thread.opened"]
+    assert opened and opened[0].get("anchor") is None          # null (real envelope omits it; see make_event test)
+
+
+def test_make_event_omits_null_anchor_but_includes_present():
+    """The real envelope carries anchor only when set (§5.4)."""
+    from discussion.events import make_event
+    assert "anchor" not in make_event("thread.opened", tenant="t")   # null -> omitted
+    assert make_event("thread.opened", tenant="t", anchor=_ANCHOR)["anchor"] == _ANCHOR
+
+
+def test_comment_viewpoint_ref_roundtrips(make):
+    c = make(reads=True)
+    tid = c.client.post("/files/f1/threads", json={"body": "hi"},
+                        headers=_auth("bob")).json()["id"]
+    r = c.client.post(f"/threads/{tid}/comments",
+                      json={"body": "pinned to a view", "viewpoint_ref": "vp-7"},
+                      headers=_auth("bob"))
+    assert r.status_code == 201
+    assert r.json()["viewpoint_ref"] == "vp-7"
+    # An ordinary comment stays unpinned.
+    r2 = c.client.post(f"/threads/{tid}/comments", json={"body": "plain"}, headers=_auth("bob"))
+    assert r2.json()["viewpoint_ref"] is None
