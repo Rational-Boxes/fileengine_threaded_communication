@@ -1,3 +1,18 @@
+# Copyright (C) 2026 James Hickman
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """SMTP delivery for the digest (SPECIFICATION §11c). Best-effort — a send failure
 returns False (the sender leaves the period unmarked for retry) and never raises.
 Same SMTP settings shape ldap_manager uses for invite/reset mail.
