@@ -23,7 +23,8 @@ dependencies = [
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "httpx>=0.27"]
 # The MCP door (§7 / M5) — FastMCP Streamable-HTTP. Optional: the core service and
 # its imports work without it (FastMCP is imported lazily in discussion.mcp_server).
-mcp = ["mcp>=1.0"]
+# Cap below 2.0: mcp 2.0.0 removed the `mcp.server.fastmcp` module the door imports.
+mcp = ["mcp>=1.2,<2"]
 
 [project.scripts]
 discussion = "discussion.app:main"
