@@ -47,10 +47,11 @@ class FakeStore:
                 "created_at": c["created_at"], "edited_at": c["edited_at"], "deleted": c["deleted"],
                 "redacted": c["redacted"], "redacted_by": c.get("redacted_by"),
                 "redacted_reason": c.get("redacted_reason"),
-                "viewpoint_ref": c.get("viewpoint_ref")}
+                "viewpoint_ref": c.get("viewpoint_ref"),
+                "markup": c.get("markup")}
 
     def create_thread(self, tenant, *, file_uid, version, title, body, body_text, opened_by,
-                      anchor=None):
+                      anchor=None, markup=None):
         tid, cid = self._id("t"), self._id("c")
         self.threads[tid] = {"id": tid, "file_uid": file_uid, "version": version, "title": title,
                              "status": "open", "resolved_by": None, "resolved_version": None,
@@ -58,7 +59,8 @@ class FakeStore:
                              "anchor_stale": False, "anchor": anchor}
         self.comments[cid] = {"id": cid, "thread_id": tid, "author": opened_by, "body": body,
                               "body_text": body_text, "created_at": "t0", "edited_at": None,
-                              "deleted": False, "redacted": False, "parent_comment_id": None}
+                              "deleted": False, "redacted": False, "parent_comment_id": None,
+                              "markup": markup}
         return self.get_thread(tenant, tid)
 
     def list_threads(self, tenant, file_uid, *, status=None):
@@ -92,13 +94,13 @@ class FakeStore:
         return self.get_thread(tenant, thread_id)
 
     def add_comment(self, tenant, thread_id, *, author, body, body_text, parent_comment_id=None,
-                    viewpoint_ref=None):
+                    viewpoint_ref=None, markup=None):
         cid = self._id("c")
         self.comments[cid] = {"id": cid, "thread_id": thread_id, "author": author, "body": body,
                               "body_text": body_text, "created_at": "t1", "edited_at": None,
                               "deleted": False, "redacted": False,
                               "parent_comment_id": parent_comment_id,
-                              "viewpoint_ref": viewpoint_ref}
+                              "viewpoint_ref": viewpoint_ref, "markup": markup}
         return self.get_comment(tenant, cid)
 
     def comment_parent_thread(self, tenant, comment_id):
@@ -535,3 +537,25 @@ def test_comment_viewpoint_ref_roundtrips(make):
     # An ordinary comment stays unpinned.
     r2 = c.client.post(f"/threads/{tid}/comments", json={"body": "plain"}, headers=_auth("bob"))
     assert r2.json()["viewpoint_ref"] is None
+
+
+def test_comment_markup_roundtrips(make):
+    """Phase 7.1: a marked-up-PDF pointer round-trips on both the opening comment
+    and replies; a plain comment carries none."""
+    c = make(reads=True)
+    _markup = {"rendition_uid": "rend-9", "name": "spec-bob-2026.pdf", "page": 3}
+    # On the opening comment (thread root).
+    opened = c.client.post("/files/f1/threads",
+                           json={"body": "marked it up", "markup": _markup},
+                           headers=_auth("bob")).json()
+    assert opened["comments"][0]["markup"] == _markup
+    tid = opened["id"]
+    # On a reply.
+    r = c.client.post(f"/threads/{tid}/comments",
+                      json={"body": "and here too", "markup": _markup},
+                      headers=_auth("bob"))
+    assert r.status_code == 201
+    assert r.json()["markup"] == _markup
+    # A plain comment carries no markup.
+    r2 = c.client.post(f"/threads/{tid}/comments", json={"body": "plain"}, headers=_auth("bob"))
+    assert r2.json()["markup"] is None

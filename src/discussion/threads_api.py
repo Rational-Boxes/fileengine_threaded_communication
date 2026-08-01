@@ -158,13 +158,16 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
     # V2 (§5.4): optional viewpoint/region anchor. None = today's file-level comment.
     # The core stays unaware; the frontend viewer for anchor.kind renders/restores it.
     anchor = (body or {}).get("anchor") or None
+    # Phase 7.1: optional per-comment marked-up-copy pointer on the opening comment.
+    # Opaque to the service; the frontend PDF viewer interprets it. None = no markup.
+    markup = (body or {}).get("markup") or None
     # Validate the opening comment's mentions *before* creating the thread (§5.1).
     valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
 
     thread = await run_in_threadpool(partial(
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
         title=title, body=text, body_text=to_plaintext(text), opened_by=ident.user,
-        anchor=anchor))
+        anchor=anchor, markup=markup))
     if thread.get("comments"):
         first = thread["comments"][0]
         await _index(request, ident.tenant, comment_id=first["id"],
@@ -274,6 +277,9 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
     # semantics). Opaque to the store; None = an ordinary, unpinned comment.
     viewpoint_ref = (body or {}).get("viewpoint_ref") or None
 
+    # Phase 7.1: optional per-comment marked-up-copy pointer (applies to replies too).
+    markup = (body or {}).get("markup") or None
+
     # Validate mentions *before* writing (§5.1): any target lacking READ error-marks
     # the whole submit so the author can fix and resubmit — no partial mention.
     valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
@@ -281,7 +287,7 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
         body=text, body_text=to_plaintext(text), parent_comment_id=parent_id,
-        viewpoint_ref=viewpoint_ref))
+        viewpoint_ref=viewpoint_ref, markup=markup))
     await _index(request, ident.tenant, comment_id=comment["id"], file_uid=file_uid,
                  thread_id=thread_id, text=to_plaintext(text))
     await _live(request, ident.tenant, file_uid,

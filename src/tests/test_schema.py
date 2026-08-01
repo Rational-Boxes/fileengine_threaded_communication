@@ -62,3 +62,12 @@ def test_tenant_ddl_has_v2_anchor_and_viewpoint_columns():
     # Additive self-heal for pre-existing tenants (idempotent form).
     assert 'ALTER TABLE "tenant_acme".threads ADD COLUMN IF NOT EXISTS anchor JSONB' in ddl
     assert 'ALTER TABLE "tenant_acme".comments ADD COLUMN IF NOT EXISTS viewpoint_ref TEXT' in ddl
+
+
+def test_tenant_ddl_has_pdf_markup_column():
+    """Phase 7.1: comments.markup JSONB (per-comment marked-up-copy pointer) + its
+    self-heal ALTER. Also guards against literal braces in the column comment, which
+    would break the DDL's str.format() rendering (regression)."""
+    ddl = tenant_ddl("acme", dimension=768)  # raises KeyError if a comment has stray {}
+    assert "markup            JSONB" in ddl or "markup JSONB" in ddl
+    assert 'ALTER TABLE "tenant_acme".comments ADD COLUMN IF NOT EXISTS markup JSONB' in ddl
