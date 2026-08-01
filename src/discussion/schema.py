@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS "{schema}".comments (
     redacted_at       TIMESTAMPTZ,
     redacted_reason   TEXT,
     viewpoint_ref     TEXT,                           -- V2 (§5.4): pin this comment to a topic viewpoint (BCF); NULL = unpinned
-    markup            JSONB,                          -- Phase 7.1: per-comment marked-up copy pointer {rendition_uid,name,page}; NULL = none. Opaque to the service; the frontend PDF viewer interprets it.
+    markup            JSONB,                          -- Phase 7.1: per-comment marked-up copy pointer (rendition_uid/name/page); NULL = none. Opaque to the service; the frontend PDF viewer interprets it.
     fts               tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body_text,''))) STORED
 );
 -- Self-heal existing tenants provisioned before nested replies / the V2 viewpoint pin / the PDF markup attachment.
