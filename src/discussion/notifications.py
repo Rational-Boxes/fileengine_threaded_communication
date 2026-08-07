@@ -28,7 +28,7 @@ from .config import Config
 from .db import connect_for_tenant
 
 KINDS = ("mention", "reply", "review_requested", "review_acknowledged",
-         "review_completed", "thread_resolved")
+         "review_completed", "review_approved", "review_rejected", "thread_resolved")
 
 
 def _val(v):

@@ -35,6 +35,17 @@ log = logging.getLogger("discussion.events")
 _SCHEMA = 1
 _MAXLEN = 100_000
 
+# Collaboration events the folder_actions service recognizes (SPEC §3.1 / §4.2).
+# These are *dual-published*: in addition to the private ``discussion:events`` side
+# stream, they are also XADD'd onto the shared recognized stream
+# ``fileengine:events`` (config.events_stream, where the core also emits) so
+# folder_actions' single-stream consumer sees them. Other internal event types
+# stay on ``discussion:events`` only.
+PROMOTED_TYPES = frozenset({
+    "review.approved", "review.rejected",
+    "thread.opened", "comment.created", "mention.created", "thread.resolved",
+})
+
 
 def _now_ts() -> str:
     # YYYYMMDD_HHMMSS.mmm — same shape as the core's event timestamps.
@@ -80,12 +91,27 @@ class EventPublisher:
                 password=self.config.redis_password or None, db=self.config.redis_db)
         return self._redis
 
-    def publish(self, etype: str, **fields) -> dict:
-        """Build + XADD an event. Best-effort — never raises into a request."""
-        evt = make_event(etype, **fields)
+    def _xadd(self, stream: str, evt: dict, etype: str) -> None:
+        """Best-effort XADD of one event to one stream — never raises."""
         try:
-            self._client().xadd(self.stream, {"payload": json.dumps(evt)},
+            self._client().xadd(stream, {"payload": json.dumps(evt)},
                                 maxlen=_MAXLEN, approximate=True)
         except Exception:
-            log.warning("event publish failed (%s) — continuing", etype, exc_info=True)
+            log.warning("event publish failed (%s -> %s) — continuing", etype, stream,
+                        exc_info=True)
+
+    def publish(self, etype: str, **fields) -> dict:
+        """Build + XADD an event. Best-effort — never raises into a request.
+
+        Always written to the private ``discussion:events`` side stream (the digest /
+        cross-channel consumers). Recognized collaboration types (``PROMOTED_TYPES``)
+        are *also* written to the shared ``fileengine:events`` recognized stream so
+        the folder_actions consumer sees them (§4.2). A failure on either write is
+        swallowed independently so one stream being down never blocks the other."""
+        evt = make_event(etype, **fields)
+        self._xadd(self.stream, evt, etype)
+        if etype in PROMOTED_TYPES:
+            shared = getattr(self.config, "events_stream", "")
+            if shared and shared != self.stream:
+                self._xadd(shared, evt, etype)
         return evt

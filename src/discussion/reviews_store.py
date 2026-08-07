@@ -78,8 +78,12 @@ class ReviewStore:
 
     def set_status(self, tenant: str, review_id: str, *, status: str,
                    outcome: Optional[str] = None) -> Optional[dict]:
-        """Advance a review. Stamps acknowledged_at / completed_at from the status."""
-        ts_col = {"acknowledged": "acknowledged_at", "completed": "completed_at"}.get(status)
+        """Advance a review. Stamps acknowledged_at / completed_at from the status.
+
+        The explicit terminal states ``approved`` / ``rejected`` (SPEC §4.2) stamp
+        ``completed_at`` like the legacy ``completed`` status they replace."""
+        ts_col = {"acknowledged": "acknowledged_at", "completed": "completed_at",
+                  "approved": "completed_at", "rejected": "completed_at"}.get(status)
         sets = ["status = %s", "outcome = COALESCE(%s, outcome)"]
         params: list = [status, outcome]
         if ts_col:
