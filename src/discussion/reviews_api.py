@@ -18,12 +18,20 @@
   POST /files/{file_uid}/reviews   raise a review {reviewers:[email], version?, thread_id?} (READ)
   GET  /files/{file_uid}/reviews   the review record for a file — all requests (READ)
   POST /reviews/{id}/acknowledge   reviewer acks → requester notified
-  POST /reviews/{id}/complete      reviewer completes {outcome} → requester notified
+  POST /reviews/{id}/complete      reviewer completes {outcome} → requester notified (legacy)
+  POST /reviews/{id}/approve       reviewer approves → requester notified (terminal)
+  POST /reviews/{id}/reject        reviewer rejects {outcome?} → requester notified (terminal)
   GET  /reviews?role=&status=      the caller's reviews (as requester and/or reviewer)
 
 Raising requires READ on the anchor; each reviewer is validated to hold READ (§5.1,
-error-marked if not). Ack/complete are reviewer-only. Notifications + discussion
-events are written on each transition.
+error-marked if not). Ack/complete/approve/reject are reviewer-only. Notifications +
+discussion events are written on each transition.
+
+The recognized review lifecycle (SPEC §4.2) is
+``requested → acknowledged → (approved | rejected)``, emitting ``review.approved`` /
+``review.rejected`` onto the shared recognized stream. The legacy ``/complete``
+endpoint (free-form ``outcome`` → ``review.completed``) is retained for backward
+compatibility.
 """
 from __future__ import annotations
 
@@ -80,7 +88,7 @@ async def raise_review(file_uid: str, request: Request, body: dict = Body(...),
 @router.get("/files/{file_uid}/reviews")
 async def list_file_reviews(file_uid: str, request: Request,
                             status: str | None = Query(
-                                None, pattern="^(requested|acknowledged|completed|declined)$"),
+                                None, pattern="^(requested|acknowledged|completed|approved|rejected|declined)$"),
                             ident: Identity = Depends(identity)) -> dict:
     """The review record for the anchor — every request raised on the file, whoever
     asked or was assigned. Visible to anyone who can READ the file (the record is
@@ -100,7 +108,9 @@ async def _transition(request: Request, review_id: str, ident: Identity, *, stat
     if review["reviewer"] != ident.user:
         raise HTTPException(status_code=403, detail="only the assigned reviewer may act on this review")
     allowed_from = {"acknowledged": ("requested",),
-                    "completed": ("requested", "acknowledged")}[status]
+                    "completed": ("requested", "acknowledged"),
+                    "approved": ("requested", "acknowledged"),
+                    "rejected": ("requested", "acknowledged")}[status]
     if review["status"] not in allowed_from:
         raise HTTPException(status_code=409, detail=f"review is {review['status']}")
 
@@ -134,10 +144,28 @@ async def complete(review_id: str, request: Request, body: dict = Body(default={
                              kind="review_completed", event="review.completed", outcome=outcome)
 
 
+@router.post("/reviews/{review_id}/approve")
+async def approve(review_id: str, request: Request, body: dict = Body(default={}),
+                  ident: Identity = Depends(identity)) -> dict:
+    """Reviewer approves — terminal (SPEC §4.2). Emits ``review.approved``."""
+    outcome = ((body or {}).get("outcome") or "").strip() or "approved"
+    return await _transition(request, review_id, ident, status="approved",
+                             kind="review_approved", event="review.approved", outcome=outcome)
+
+
+@router.post("/reviews/{review_id}/reject")
+async def reject(review_id: str, request: Request, body: dict = Body(default={}),
+                 ident: Identity = Depends(identity)) -> dict:
+    """Reviewer rejects — terminal (SPEC §4.2). Emits ``review.rejected``."""
+    outcome = ((body or {}).get("outcome") or "").strip() or "rejected"
+    return await _transition(request, review_id, ident, status="rejected",
+                             kind="review_rejected", event="review.rejected", outcome=outcome)
+
+
 @router.get("/reviews")
 async def list_reviews(request: Request,
                        role: str = Query("both", pattern="^(requester|reviewer|both)$"),
-                       status: str | None = Query(None, pattern="^(requested|acknowledged|completed|declined)$"),
+                       status: str | None = Query(None, pattern="^(requested|acknowledged|completed|approved|rejected|declined)$"),
                        ident: Identity = Depends(identity)) -> dict:
     reviews = await run_in_threadpool(partial(
         _s(request, "reviews").list_for, ident.tenant, ident.user, role=role, status=status))

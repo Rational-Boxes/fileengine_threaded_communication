@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS "{schema}".review_requests (
     requester       TEXT NOT NULL,
     reviewer        TEXT NOT NULL,                  -- one row per reviewer
     status          TEXT NOT NULL DEFAULT 'requested'
-                    CHECK (status IN ('requested','acknowledged','completed','declined')),
+                    CHECK (status IN ('requested','acknowledged','completed','declined',
+                                      'approved','rejected')),
     outcome         TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     acknowledged_at TIMESTAMPTZ,
@@ -131,6 +132,13 @@ CREATE TABLE IF NOT EXISTS "{schema}".review_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewer ON "{schema}".review_requests (reviewer, status);
 CREATE INDEX IF NOT EXISTS idx_reviews_requester ON "{schema}".review_requests (requester, status);
+-- Migration: the explicit approve/reject transitions introduced the terminal
+-- 'approved'/'rejected' states; widen the pre-existing status CHECK on already
+-- provisioned tenants (a superset, so no row can violate it). Idempotent via
+-- DROP IF EXISTS + re-ADD.
+ALTER TABLE "{schema}".review_requests DROP CONSTRAINT IF EXISTS review_requests_status_check;
+ALTER TABLE "{schema}".review_requests ADD CONSTRAINT review_requests_status_check
+    CHECK (status IN ('requested','acknowledged','completed','declined','approved','rejected'));
 
 -- The attention feed backing store (one row per thing wanting a user's attention).
 CREATE TABLE IF NOT EXISTS "{schema}".notifications (
@@ -138,7 +146,7 @@ CREATE TABLE IF NOT EXISTS "{schema}".notifications (
     user_id   TEXT NOT NULL,
     kind      TEXT NOT NULL CHECK (kind IN
                 ('mention','reply','review_requested','review_acknowledged',
-                 'review_completed','thread_resolved')),
+                 'review_completed','review_approved','review_rejected','thread_resolved')),
     file_uid  TEXT NOT NULL,                        -- for a read-time ACL re-check before display
     thread_id TEXT,
     review_id TEXT,
@@ -147,6 +155,12 @@ CREATE TABLE IF NOT EXISTS "{schema}".notifications (
     read_at   TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_notif_user ON "{schema}".notifications (user_id, read_at, created_at DESC);
+-- Migration: approve/reject emit 'review_approved'/'review_rejected' notification
+-- kinds; widen the pre-existing kind CHECK on already provisioned tenants.
+ALTER TABLE "{schema}".notifications DROP CONSTRAINT IF EXISTS notifications_kind_check;
+ALTER TABLE "{schema}".notifications ADD CONSTRAINT notifications_kind_check
+    CHECK (kind IN ('mention','reply','review_requested','review_acknowledged',
+                    'review_completed','review_approved','review_rejected','thread_resolved'));
 
 -- Comment text vectorized for RAG (§6). Keyed by anchor file_uid so the existing
 -- can_read(file_uid) gate applies unchanged.
