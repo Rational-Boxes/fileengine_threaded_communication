@@ -51,7 +51,10 @@ def extract_tenant(headers: dict, host: str, default: str) -> str:
     host = (host or "").split(":", 1)[0]
     labels = host.split(".")
     if len(labels) >= 3:
-        first = labels[0].strip().lower()
+        # Tenant ids contain no hyphen; an <tenant>-<interface> label (e.g. acme-drive)
+        # resolves to the tenant — the first hyphen-delimited segment. Matches the
+        # bridge/WebDAV/SPA rule (systemwide consistency).
+        first = labels[0].strip().lower().split("-", 1)[0]
         if first and first not in ("www", "api", "localhost"):
             return first
     return default
