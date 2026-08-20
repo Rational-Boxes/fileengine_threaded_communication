@@ -156,11 +156,34 @@ CREATE TABLE IF NOT EXISTS "{schema}".notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notif_user ON "{schema}".notifications (user_id, read_at, created_at DESC);
 -- Migration: approve/reject emit 'review_approved'/'review_rejected' notification
--- kinds; widen the pre-existing kind CHECK on already provisioned tenants.
+-- kinds; share links add four more. Widen the pre-existing kind CHECK on already
+-- provisioned tenants.
+--
+-- NB this CHECK is the SECOND place a kind must be listed; notifications.KINDS
+-- is the first, and it drops unknown kinds silently rather than erroring. A kind
+-- added here but not there vanishes with no log line.
 ALTER TABLE "{schema}".notifications DROP CONSTRAINT IF EXISTS notifications_kind_check;
 ALTER TABLE "{schema}".notifications ADD CONSTRAINT notifications_kind_check
     CHECK (kind IN ('mention','reply','review_requested','review_acknowledged',
-                    'review_completed','review_approved','review_rejected','thread_resolved'));
+                    'review_completed','review_approved','review_rejected','thread_resolved',
+                    'share_drop_received','share_link_dead','share_otp_send_failed',
+                    'share_first_redemption'));
+
+-- Share-link attention items (share_service, spec §10.6). Two columns:
+--
+--   share_link_uid — the notifications row had nowhere to put one, and a share
+--     item must deep-link to the resource's Share tab rather than to
+--     the file's preview route with a thread anchor, which does not even
+--     exist for a folder.
+--
+--   detail_text — the row rendered WITHOUT resolving the resource. The feed
+--     re-checks READ per row, and "your link stopped working" is raised
+--     precisely BECAUSE the creator lost access — so the one item that matters
+--     most is the one that filter would suppress. Denormalizing the text keeps
+--     the filter honest instead of carving an exemption into it, and leaks
+--     nothing the creator did not already know when they minted the link.
+ALTER TABLE "{schema}".notifications ADD COLUMN IF NOT EXISTS share_link_uid TEXT;
+ALTER TABLE "{schema}".notifications ADD COLUMN IF NOT EXISTS detail_text TEXT;
 
 -- Comment text vectorized for RAG (§6). Keyed by anchor file_uid so the existing
 -- can_read(file_uid) gate applies unchanged.

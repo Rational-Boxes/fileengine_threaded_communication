@@ -166,3 +166,52 @@ def test_get_comment_resolves_and_gates(make):
 
     c2 = make(reads=None, store={"comments": {"c1": comment}})
     assert c2.client.get("/comments/c1", headers=_auth("bob")).status_code == 403
+
+
+# --- share items in the feed (spec §10.6) --------------------------------
+
+def _share_row(**over):
+    return {"id": 9, "user_id": "bob", "kind": "share_link_dead", "file_uid": "gone",
+            "thread_id": None, "review_id": None, "actor": "system:share",
+            "created_at": "t", "read_at": None, "share_link_uid": "l1",
+            "detail_text": "Q3 drawings", "source": "sharing", **over}
+
+
+def test_a_self_contained_share_row_survives_the_read_filter(make):
+    """The whole reason detail_text exists.
+
+    "Your link stopped working" is raised precisely BECAUSE the creator lost
+    access to the resource — so the per-row READ re-check would suppress the one
+    item that most needs to arrive.
+    """
+    c = make(reads=set(), notes=[_share_row()])   # nothing readable at all
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert [i["id"] for i in items] == [9]
+    assert items[0]["detail_text"] == "Q3 drawings"
+
+
+def test_a_soft_deleted_resource_does_not_hide_a_share_row_either(make):
+    c = make(reads=True, live=set(), notes=[_share_row()])
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert [i["id"] for i in items] == [9]
+
+
+def test_the_exemption_is_for_self_contained_rows_not_for_share_kinds(make):
+    """Narrow on purpose: a share row WITHOUT its own text is still filtered.
+
+    A per-kind allowlist would drift the moment a kind is added, and would let a
+    row that genuinely needs resolving through unresolved.
+    """
+    c = make(reads=set(), notes=[_share_row(detail_text=None)])
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert items == []
+
+
+def test_ordinary_rows_are_still_filtered(make):
+    # Guard on the guard: the exemption must not have loosened the normal path.
+    rows = [{"id": 1, "user_id": "bob", "kind": "mention", "file_uid": "f1",
+             "thread_id": "t1", "review_id": None, "actor": "carol",
+             "created_at": "t", "read_at": None, "detail_text": None}]
+    c = make(reads=set(), notes=rows)
+    assert c.client.get("/dashboard/attention",
+                        headers=_auth("bob")).json()["items"] == []

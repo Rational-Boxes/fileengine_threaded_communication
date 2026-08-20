@@ -34,6 +34,8 @@ import json
 import logging
 from typing import List, Tuple
 
+from .notifications import KINDS as NOTIFY_KINDS, SYSTEM_ACTOR
+
 log = logging.getLogger("discussion.consumer")
 
 _ACTIVITY = {"file.created": "created", "file.updated": "updated", "file.restored": "restored"}
@@ -41,11 +43,14 @@ Entry = Tuple[str, dict]
 
 
 class EventConsumer:
-    def __init__(self, config, *, activity, store, permissions):
+    def __init__(self, config, *, activity, store, permissions, notifications=None):
         self.config = config
         self.activity = activity
         self.store = store
         self.permissions = permissions
+        # Optional so existing constructions (and tests) keep working; a share
+        # event with no store logs and moves on rather than crashing the loop.
+        self.notifications = notifications
 
     def handle(self, event: dict) -> None:
         if event.get("is_rendition"):
@@ -73,6 +78,50 @@ class EventConsumer:
                 self._invalidate("invalidate_member", tenant, member)
         elif etype == "role.deleted":
             self._invalidate("invalidate_tenant", tenant)
+        elif etype.startswith("share."):
+            # Share links (spec §10.6). share_service publishes these onto the
+            # same stream the core uses, so no new transport is introduced.
+            #
+            # WHICH events exist is share_service's decision (its
+            # `share.attention_events` setting) — this end raises whatever
+            # arrives. Gating in both places would mean an operator turning an
+            # event on and nothing happening.
+            #
+            # A drop ALSO arrives as an ordinary file.created, which is handled
+            # above. That branch records document ACTIVITY and never writes a
+            # notification, so a drop is not raised twice.
+            self._share_notification(tenant, etype, event)
+
+    def _share_notification(self, tenant: str, etype: str, event: dict) -> None:
+        if self.notifications is None:
+            log.warning("share event %s dropped: no notification store", etype)
+            return
+        creator = event.get("creator") or ""
+        if not creator:
+            log.warning("share event %s has no creator; nothing to notify", etype)
+            return
+        kind = etype.replace(".", "_", 1)
+        if kind not in NOTIFY_KINDS:
+            log.warning("share event %s maps to unknown kind %s", etype, kind)
+            return
+        # The actor must never be the creator: add() suppresses
+        # self-notification, so a creator's own links could otherwise never
+        # notify them. An external redeemer is named; a link that simply went
+        # dead has no human behind it and gets the reserved system actor.
+        actor = event.get("actor") or SYSTEM_ACTOR
+        if actor == creator:
+            actor = SYSTEM_ACTOR
+        try:
+            self.notifications.add(
+                tenant, user_id=creator, kind=kind,
+                file_uid=event.get("file_uid", ""), actor=actor,
+                share_link_uid=event.get("link_uid") or None,
+                # Denormalized so the row renders without resolving the
+                # resource — the point of which is that "your link stopped
+                # working" usually means the creator can no longer read it.
+                detail_text=event.get("detail") or None)
+        except Exception:
+            log.exception("failed recording share notification %s", etype)
 
     def _invalidate(self, method: str, *args) -> None:
         fn = getattr(self.permissions, method, None)
@@ -150,6 +199,7 @@ def main() -> None:
 
     from .activity_store import ActivityStore
     from .config import Config, load_dotenv
+    from .notifications import NotificationStore
     from .permissions import Permissions
     from .store import ThreadStore
 
@@ -157,7 +207,8 @@ def main() -> None:
     load_dotenv()
     config = Config()
     consumer = EventConsumer(config, activity=ActivityStore(config), store=ThreadStore(config),
-                             permissions=Permissions(config))
+                             permissions=Permissions(config),
+                             notifications=NotificationStore(config))
     log.info("discussion consumer — stream=%s group=%s", config.events_stream, config.events_group)
     consumer.run_forever(RedisEventSource(config))
 
