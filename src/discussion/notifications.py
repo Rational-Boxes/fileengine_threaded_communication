@@ -35,7 +35,7 @@ KINDS = ("mention", "reply", "review_requested", "review_acknowledged",
          # Share links (spec §10.6). The feed is one place a user looks; share
          # events join it rather than growing a parallel one.
          "share_drop_received", "share_link_dead", "share_otp_send_failed",
-         "share_first_redemption")
+         "share_first_redemption", "share_link_locked")
 
 # Which system a kind came from, mapped at WRITE time and returned by the API.
 #
@@ -50,6 +50,7 @@ SOURCES = {
     "review_rejected": "reviews",
     "share_drop_received": "sharing", "share_link_dead": "sharing",
     "share_otp_send_failed": "sharing", "share_first_redemption": "sharing",
+    "share_link_locked": "sharing",
 }
 
 # The actor recorded for share events that have no external human behind them
