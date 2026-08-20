@@ -60,8 +60,21 @@ async def attention(request: Request, limit: int = Query(50, ge=1, le=200),
     # Re-check READ per row (over-fetch → filter), so a lost-access item disappears,
     # and drop items whose anchor file is soft-deleted (same guard as the activity
     # feed) — a trashed document must not surface in any dashboard feed.
+    #
+    # One exception, and it is the reason `detail_text` exists. A share item like
+    # "your link stopped working" is raised PRECISELY BECAUSE the creator lost
+    # access to the resource, so this filter would suppress the single item that
+    # most needs to arrive. Rows carrying their own text are self-contained: they
+    # are rendered without resolving `file_uid` at all, so nothing is disclosed
+    # that the recipient did not already know when they minted the link.
+    #
+    # The exemption is narrow on purpose — self-contained rows only. It is not a
+    # per-kind allowlist, because that would drift the moment a kind is added.
     out = []
     for r in rows:
+        if r.get("detail_text"):
+            out.append(r)
+            continue
         if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
             out.append(r)
     return {"items": out}

@@ -106,3 +106,82 @@ def test_unknown_event_is_a_noop():
     c, a, s, p = _mk()
     c.handle({"type": "file.renamed", "tenant": "t1", "file_uid": "f1"})
     assert a.records == [] and s.stale == [] and p.calls == []
+
+
+# --- share events (spec §10.6) -------------------------------------------
+
+class FakeNotifications:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, tenant, **kw):
+        self.rows.append({"tenant": tenant, **kw})
+
+
+def _mk_share():
+    a, s, p = FakeActivity(), FakeStore(), FakePerms()
+    n = FakeNotifications()
+    return EventConsumer(None, activity=a, store=s, permissions=p,
+                         notifications=n), n, a
+
+
+def test_a_drop_notifies_the_creator_naming_the_redeemer():
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.drop_received", "tenant": "t", "creator": "alice",
+              "actor": "share:l1|bob@contractor.example", "link_uid": "l1",
+              "file_uid": "f1", "detail": "plans.pdf"})
+    assert len(n.rows) == 1
+    assert n.rows[0]["kind"] == "share_drop_received"
+    assert n.rows[0]["user_id"] == "alice"
+    assert n.rows[0]["share_link_uid"] == "l1"
+    # The verified name is the confirmation the sender is waiting for.
+    assert "bob@contractor.example" in n.rows[0]["actor"]
+
+
+def test_a_creator_is_never_their_own_actor():
+    """add() suppresses self-notification, so a share event whose actor IS the
+    creator would silently never notify them — the exact failure this guards."""
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.link_dead", "tenant": "t", "creator": "alice",
+              "actor": "alice", "link_uid": "l2", "detail": "Q3 drawings"})
+    assert n.rows[0]["actor"] != "alice"
+    assert n.rows[0]["actor"].startswith("system:")
+
+
+def test_a_system_event_with_no_actor_still_notifies():
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.otp_send_failed", "tenant": "t", "creator": "alice",
+              "link_uid": "l3", "detail": "code to bob@x.example"})
+    assert n.rows[0]["kind"] == "share_otp_send_failed"
+    assert n.rows[0]["actor"] == "system:share"
+
+
+def test_share_rows_carry_their_own_text():
+    """So the feed can render them without resolving the resource — "your link
+    stopped working" usually means the creator can no longer read it."""
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.link_dead", "tenant": "t", "creator": "alice",
+              "link_uid": "l4", "detail": "Drawing-A.pdf"})
+    assert n.rows[0]["detail_text"] == "Drawing-A.pdf"
+
+
+def test_an_unknown_share_event_is_dropped_not_written():
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.something_new", "tenant": "t", "creator": "alice"})
+    assert n.rows == []
+
+
+def test_a_share_event_without_a_creator_notifies_nobody():
+    c, n, _ = _mk_share()
+    c.handle({"type": "share.drop_received", "tenant": "t", "link_uid": "l5"})
+    assert n.rows == []
+
+
+def test_a_drop_is_not_notified_twice_by_its_file_created():
+    """A drop also lands as an ordinary file.created. That path records document
+    ACTIVITY and must not also raise an attention item."""
+    c, n, a = _mk_share()
+    c.handle({"type": "file.created", "tenant": "t", "file_uid": "f1",
+              "actor": "alice", "name": "plans.pdf"})
+    assert n.rows == []
+    assert a.records  # ...but it did record activity

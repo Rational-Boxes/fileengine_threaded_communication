@@ -71,3 +71,22 @@ def test_tenant_ddl_has_pdf_markup_column():
     ddl = tenant_ddl("acme", dimension=768)  # raises KeyError if a comment has stray {}
     assert "markup            JSONB" in ddl or "markup JSONB" in ddl
     assert 'ALTER TABLE "tenant_acme".comments ADD COLUMN IF NOT EXISTS markup JSONB' in ddl
+
+
+def test_ddl_template_has_no_accidental_placeholders():
+    """The DDL is rendered with .format(), so ANY brace in it is a substitution
+    — including one inside a SQL comment.
+
+    A comment mentioning a route like /preview/{file_uid} raised KeyError at
+    render time and took every provisioning path down with it. The only legal
+    placeholder is {schema}.
+    """
+    import re
+    from discussion import schema as sch
+    raw = sch._TENANT_DDL if hasattr(sch, "_TENANT_DDL") else None
+    if raw is None:                                  # pragma: no cover
+        import inspect
+        raw = inspect.getsource(sch)
+    names = set(re.findall(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})", raw))
+    supplied = {"schema", "dimension"}     # what tenant_ddl() passes to format()
+    assert names <= supplied, f"unescaped placeholders in the DDL: {sorted(names - supplied)}"

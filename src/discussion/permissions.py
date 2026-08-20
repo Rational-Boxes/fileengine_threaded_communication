@@ -58,7 +58,16 @@ class Permissions:
             log.warning("permission check: could not build core client", exc_info=True)
             return False
         try:
-            return bool(mf.check_permission(file_uid, perm, tenant=identity.tenant))
+            if not mf.check_permission(file_uid, perm, tenant=identity.tenant):
+                return False
+            # Existence is part of "may they reach it", and the core will not
+            # tell us as part of the permission answer: CheckPermission
+            # evaluates ACL rules only, and read-by-default (`default_read_ =
+            # true`) grants when no rule matches -- which is also the case for
+            # a uid that does not exist or has been soft-deleted. Without this
+            # the gate says yes about a file that is gone. Verified against a
+            # live core, 2026-08-20. One extra RPC, on the granted path only.
+            return bool(mf.entity_exists(file_uid))
         except Exception:
             log.warning("permission check failed for %s on %s", perm, file_uid, exc_info=True)
             return False

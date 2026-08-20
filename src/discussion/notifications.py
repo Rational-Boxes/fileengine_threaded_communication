@@ -27,8 +27,43 @@ from typing import Optional
 from .config import Config
 from .db import connect_for_tenant
 
+# NB `add()` DROPS an unknown kind silently (see below), and schema.py carries a
+# matching CHECK constraint. A new kind must be added in both places or its
+# notifications vanish with no log line.
 KINDS = ("mention", "reply", "review_requested", "review_acknowledged",
-         "review_completed", "review_approved", "review_rejected", "thread_resolved")
+         "review_completed", "review_approved", "review_rejected", "thread_resolved",
+         # Share links (spec §10.6). The feed is one place a user looks; share
+         # events join it rather than growing a parallel one.
+         "share_drop_received", "share_link_dead", "share_otp_send_failed",
+         "share_first_redemption", "share_link_locked")
+
+# Which system a kind came from, mapped at WRITE time and returned by the API.
+#
+# Deriving this in the SPA by string-matching the kind would put the mapping in
+# the one place that does not know when a new kind is added here. A source the
+# SPA does not recognise renders under its own raw heading rather than
+# disappearing, so an unmapped kind degrades visibly.
+SOURCES = {
+    "mention": "comments", "reply": "comments", "thread_resolved": "comments",
+    "review_requested": "reviews", "review_acknowledged": "reviews",
+    "review_completed": "reviews", "review_approved": "reviews",
+    "review_rejected": "reviews",
+    "share_drop_received": "sharing", "share_link_dead": "sharing",
+    "share_otp_send_failed": "sharing", "share_first_redemption": "sharing",
+    "share_link_locked": "sharing",
+}
+
+# The actor recorded for share events that have no external human behind them
+# (a link went dead; an OTP send failed). It must NOT be the creator: `add()`
+# suppresses self-notification, so a creator's own links could never notify
+# them. Reserved, and shaped so it cannot collide with an LDAP username.
+SYSTEM_ACTOR = "system:share"
+
+
+def source_for(kind: str) -> str:
+    """`SOURCES` with a safe default — an unmapped kind gets its own division
+    rather than being silently filed under someone else's."""
+    return SOURCES.get(kind, "other")
 
 
 def _val(v):
@@ -40,17 +75,30 @@ class NotificationStore:
         self.config = config
 
     def add(self, tenant: str, *, user_id: str, kind: str, file_uid: str, actor: str,
-            thread_id: Optional[str] = None, review_id: Optional[str] = None) -> None:
-        """Record a notification. No self-notification (actor == recipient is skipped)."""
+            thread_id: Optional[str] = None, review_id: Optional[str] = None,
+            share_link_uid: Optional[str] = None,
+            detail_text: Optional[str] = None) -> None:
+        """Record a notification. No self-notification (actor == recipient is skipped).
+
+        The self-notification rule is a trap for share items, which are addressed
+        TO the creator: the actor must be the external redeemer or `SYSTEM_ACTOR`,
+        never `created_by`, or a creator's own links can never notify them.
+
+        `detail_text` makes a row self-contained, so the feed can render it
+        without resolving `file_uid` — see the READ re-check note in
+        dashboard_api.
+        """
         if not user_id or user_id == actor or kind not in KINDS:
             return
         conn = connect_for_tenant(self.config, tenant, provision=True)
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO notifications (user_id, kind, file_uid, thread_id, review_id, actor) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (user_id, kind, file_uid, thread_id, review_id, actor))
+                    "INSERT INTO notifications (user_id, kind, file_uid, thread_id, "
+                    "review_id, actor, share_link_uid, detail_text) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (user_id, kind, file_uid, thread_id, review_id, actor,
+                     share_link_uid, detail_text))
             conn.commit()
         finally:
             conn.close()
@@ -59,7 +107,8 @@ class NotificationStore:
                  unread_only: bool = False, since: Optional[str] = None) -> list[dict]:
         """The caller's attention feed (§10a) / digest window (§11b). The handler
         re-checks READ per row."""
-        sql = ("SELECT id, kind, file_uid, thread_id, review_id, actor, created_at, read_at "
+        sql = ("SELECT id, kind, file_uid, thread_id, review_id, actor, created_at, "
+               "read_at, share_link_uid, detail_text "
                "FROM notifications WHERE user_id = %s")
         params: list = [user]
         if unread_only:
@@ -74,7 +123,15 @@ class NotificationStore:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 cols = [c[0] for c in cur.description]
-                return [{k: _val(v) for k, v in zip(cols, row)} for row in cur.fetchall()]
+                out = []
+                for row in cur.fetchall():
+                    item = {k: _val(v) for k, v in zip(cols, row)}
+                    # Mapped here rather than stored: a stored value would be
+                    # frozen at write time and could not be corrected without a
+                    # migration, and the mapping is not user data.
+                    item["source"] = source_for(item["kind"])
+                    out.append(item)
+                return out
         finally:
             conn.close()
 
