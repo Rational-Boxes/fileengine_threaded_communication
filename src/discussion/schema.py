@@ -249,11 +249,32 @@ def tenant_ddl(tenant: str, dimension: int = 1024) -> str:
     return _TENANT_DDL.format(schema=schema_name(tenant), dimension=int(dimension))
 
 
+# Namespace for the provisioning advisory lock. Arbitrary but fixed: it keeps
+# these locks from colliding with any other advisory lock taken on this database.
+_PROVISION_LOCK_CLASS = 0x0D15C
+
+
 def ensure_tenant_schema(conn, tenant: str, dimension: int = 1024) -> str:
     """Create the tenant's schema + tables if absent (idempotent). ``conn`` is an
-    open psycopg connection (extensions must already exist at the DB level)."""
+    open psycopg connection (extensions must already exist at the DB level).
+
+    Serialised across PROCESSES by an advisory lock, because idempotent DDL is
+    not the same as concurrency-safe DDL: two transactions running these
+    statements at once take table locks in interleaved order and Postgres breaks
+    the tie by killing one with DeadlockDetected. Waiting behind a lock turns a
+    random 500 into a short queue. ``db.connect_for_tenant`` holds the matching
+    in-process lock; this covers the workers, the consumer and the digest job,
+    which are separate processes and cannot see each other's memo.
+
+    The lock is transaction-scoped, so the ``commit`` below releases it — which
+    also means this must NOT be handed an autocommit connection, or the lock
+    would be dropped before the DDL it is meant to guard."""
     name = schema_name(tenant)
     with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (_PROVISION_LOCK_CLASS, name),
+        )
         cur.execute(tenant_ddl(tenant, dimension))
     conn.commit()
     return name

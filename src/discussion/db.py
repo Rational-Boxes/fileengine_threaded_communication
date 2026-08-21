@@ -23,6 +23,7 @@ and naturally scoped to one tenant.
 """
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 from .config import Config
@@ -82,25 +83,43 @@ def provision_tenant(config: Config, tenant: str) -> str:
 
 
 # Tenants whose schema has been ensured in this process.
+#
+# The lock is not optional. Provisioning is check-then-act — "not in the set" is
+# decided, THEN the DDL runs, THEN the name is added — and FastAPI runs sync
+# handlers on an anyio worker pool, so a single page load fans several threads
+# into that window at once. They then run the same CREATE/ALTER statements in
+# separate transactions, acquiring locks on the same tables in interleaved
+# order, and Postgres resolves it by killing one with DeadlockDetected. The
+# caller sees a 500 on a read that has nothing to do with schema changes, and
+# only sometimes, which is what made this hard to place from the symptom.
 _provisioned: set[str] = set()
+_provision_lock = threading.Lock()
 
 
 def connect_for_tenant(config: Config, tenant: str, provision: bool = False, readonly: bool = False):
     """A connection whose ``search_path`` is the tenant's schema (then ``public``).
-    The schema is ensured on the first connection to a tenant in this process (and
-    whenever ``provision=True``). ``readonly=True`` routes reads to the replica during
-    a master outage and skips schema DDL."""
+    The schema is ensured once per tenant per process. ``readonly=True`` routes
+    reads to the replica during a master outage and skips schema DDL.
+
+    ``provision=True`` marks a caller that *requires* the tables to exist rather
+    than merely reading them. It no longer forces the DDL to re-run: it used to,
+    which meant the six stores that pass it re-provisioned on EVERY call, so the
+    idempotent-and-therefore-harmless DDL was in fact running under every
+    concurrent request for the life of the process."""
     conn = connect(config, readonly=readonly)
     # Provision on demand — including read-only reads, so a tenant whose *first*
     # request is a dashboard/search read doesn't hit missing tables. Skip DDL only
     # when this connection is a read-only replica (a standby can't run it; the
     # master keeps the schema in sync).
     on_replica = readonly and getattr(config, "pg_replica_enabled", False)
-    if (provision or tenant not in _provisioned) and not on_replica:
-        name = ensure_tenant_schema(conn, tenant, config.embedding_dimension)
-        _provisioned.add(tenant)
-    else:
-        name = schema_name(tenant)
+    name = schema_name(tenant)
+    if tenant not in _provisioned and not on_replica:
+        with _provision_lock:
+            # Re-check inside the lock: whoever held it may have just done this,
+            # and re-running the DDL is the thing being avoided.
+            if tenant not in _provisioned:
+                ensure_tenant_schema(conn, tenant, config.embedding_dimension)
+                _provisioned.add(tenant)
     with conn.cursor() as cur:
         cur.execute(f'SET search_path TO "{name}", public')
         timeout = int(getattr(config, "db_statement_timeout_ms", 0) or 0)
