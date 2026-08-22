@@ -1,7 +1,7 @@
 # Discussion & Threaded Communication — Service Specification
 
 **Roadmap phase:** This service is the implementation of **Phase 2 — Anchored discussion
-threads** in `scripts/documnets/FILEENGINE_ROADMAP.md`, with forward hooks into
+threads** in `scripts/documents/FILEENGINE_ROADMAP.md`, with forward hooks into
 **Phase 1 (provenance)** and **Phase 3 (ACL-filtered digests)**. Read that roadmap first;
 this document is the engineering spec for the phase, not a restatement of its strategy.
 
