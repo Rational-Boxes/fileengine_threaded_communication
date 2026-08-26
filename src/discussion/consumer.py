@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import List, Tuple
 
 from .notifications import KINDS as NOTIFY_KINDS, SYSTEM_ACTOR
@@ -136,12 +137,39 @@ class EventConsumer:
     def run_forever(self, source) -> None:
         source.ensure_group()
         while True:
-            for msg_id, event in source.read():
-                try:
-                    self.handle(event)
-                except Exception:
-                    log.exception("failed handling event %s", msg_id)
-                source.ack([msg_id])
+            # The whole CYCLE is guarded, not just handle(). Only the per-event
+            # work used to be, so anything raised by source.read() or ack() — a
+            # dropped connection, a restarted server — escaped the loop and ended
+            # the process. Exiting 0 under `restart_policy: always` looks like a
+            # clean stop, so the failure showed up as a container quietly
+            # restarting every few minutes rather than as an error anyone chased.
+            try:
+                for msg_id, event in source.read():
+                    try:
+                        self.handle(event)
+                    except Exception:
+                        log.exception("failed handling event %s", msg_id)
+                    source.ack([msg_id])
+            except KeyboardInterrupt:  # pragma: no cover - operator stop
+                log.info("discussion consumer stopping")
+                return
+            except Exception:
+                # Back off before retrying: if Redis is genuinely down, an
+                # unthrottled loop would spin on failed connections.
+                log.exception("discussion consumer cycle failed; retrying in %ss",
+                              CYCLE_BACKOFF_S)
+                source.reset()
+                time.sleep(CYCLE_BACKOFF_S)
+
+
+#: Socket read timeout. Deliberately well above the 5s block used by read(), so a
+#: blocking XREADGROUP on an idle stream completes normally rather than racing the
+#: socket deadline. Still bounded, so a genuinely hung server is detected.
+SOCKET_TIMEOUT_S = 30
+
+#: Pause after a failed cycle, so a persistently unreachable Redis is retried
+#: steadily rather than spun on.
+CYCLE_BACKOFF_S = 5
 
 
 class RedisEventSource:
@@ -158,7 +186,14 @@ class RedisEventSource:
             import redis
             self._redis = redis.Redis(
                 host=self.config.redis_host, port=self.config.redis_port,
-                password=self.config.redis_password or None, db=self.config.redis_db)
+                password=self.config.redis_password or None, db=self.config.redis_db,
+                # MUST exceed the block time of the read below. redis-py 8 defaults
+                # socket_timeout to 5s and this consumer blocks for 5000ms, so on an
+                # idle stream the socket gave up at the same instant the server was
+                # due to answer "no events" — a guaranteed race that fired on every
+                # quiet poll. Headroom turns the idle case back into an ordinary
+                # empty reply instead of an exception plus a reconnect.
+                socket_timeout=SOCKET_TIMEOUT_S)
         return self._redis
 
     def ensure_group(self) -> None:
@@ -180,8 +215,16 @@ class RedisEventSource:
             return {}
 
     def read(self, count: int = 64, block_ms: int = 5000) -> List[Entry]:
-        resp = self._client().xreadgroup(self.group, self.consumer, {self.stream: ">"},
-                                         count=count, block=block_ms)
+        import redis
+        try:
+            resp = self._client().xreadgroup(self.group, self.consumer, {self.stream: ">"},
+                                             count=count, block=block_ms)
+        except redis.exceptions.TimeoutError:
+            # Still caught, even with the headroom above: a caller may pass a
+            # block_ms longer than the socket timeout, and a timed-out blocking
+            # read means "no events", not a failure. Returning an empty batch is
+            # what the poll loop already does with an idle stream.
+            return []
         out: List[Entry] = []
         for _stream, messages in resp or []:
             for msg_id, fields in messages:
@@ -192,6 +235,18 @@ class RedisEventSource:
     def ack(self, msg_ids: List[str]) -> None:
         if msg_ids:
             self._client().xack(self.stream, self.group, *msg_ids)
+
+    def reset(self) -> None:
+        """Drop the cached client so the next cycle reconnects.
+
+        A connection that failed mid-cycle may be unusable; rebuilding is cheap
+        and avoids retrying forever through a dead socket."""
+        try:
+            if self._redis is not None:
+                self._redis.close()
+        except Exception:
+            pass
+        self._redis = None
 
 
 def main() -> None:
