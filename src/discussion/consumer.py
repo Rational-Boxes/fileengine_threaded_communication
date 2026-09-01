@@ -43,8 +43,15 @@ _ACTIVITY = {"file.created": "created", "file.updated": "updated", "file.restore
 Entry = Tuple[str, dict]
 
 
+# The name this service acknowledges erasures under; must match the core's
+# FILEENGINE_ERASURE_PARTICIPANTS entry, or the core waits forever for an
+# acknowledgement filed under a name it is not looking for.
+ERASURE_PARTICIPANT = "discussion"
+
+
 class EventConsumer:
-    def __init__(self, config, *, activity, store, permissions, notifications=None):
+    def __init__(self, config, *, activity, store, permissions, notifications=None,
+                 core=None):
         self.config = config
         self.activity = activity
         self.store = store
@@ -52,6 +59,70 @@ class EventConsumer:
         # Optional so existing constructions (and tests) keep working; a share
         # event with no store logs and moves on rather than crashing the loop.
         self.notifications = notifications
+        # Optional so existing constructions and tests need not grow a gRPC
+        # dependency they do not use. Without it an erasure is still honoured
+        # locally — the data is destroyed — but cannot be acknowledged, so the
+        # core keeps offering it and the sweep will retry. That is the safe
+        # direction: unacknowledged is visible, silently-uncomplied is not.
+        self.core = core
+
+    # ── Erasure (PROPOSAL_accountability_record.md §5.4) ────────────────────
+
+    def _honour_erasure(self, tenant: str, uid: str, erasure_id: str = "") -> None:
+        """Destroy this file's discussion, then say so — or say plainly that we could not."""
+        try:
+            counts = self.store.erase_file(tenant, uid, erasure_id)
+            self.activity.delete_for_file(tenant, uid)
+        except Exception as e:            # noqa: BLE001 — the reason must reach the record
+            log.error("erasure %s: could not destroy discussion for %s: %s",
+                      erasure_id or "(event)", uid, e)
+            self._acknowledge(tenant, erasure_id, False, f"destroy failed: {e}")
+            raise
+        log.info("erased discussion for %s (threads=%s, comments=%s)",
+                 uid, counts["threads"], counts["comments"])
+        self._acknowledge(
+            tenant, erasure_id, True,
+            f"destroyed {counts['threads']} thread(s), {counts['comments']} comment(s), "
+            "revisions and pre-redaction bodies")
+
+    def _acknowledge(self, tenant: str, erasure_id: str, complied: bool, detail: str) -> None:
+        if not erasure_id or self.core is None:
+            return
+        try:
+            state = self.core.acknowledge_erasure(
+                erasure_id, ERASURE_PARTICIPANT, complied=complied, detail=detail,
+                tenant=tenant)
+            log.info("acknowledged erasure %s (complied=%s) -> %s", erasure_id, complied, state)
+        except Exception as e:            # noqa: BLE001
+            # The destruction already committed. A lost ack delays completion,
+            # which is the safe direction; the sweep re-offers it.
+            log.warning("erasure %s destroyed locally but ack failed: %s", erasure_id, e)
+
+    def sweep_erasures(self, tenants, limit: int = 100) -> int:
+        """The guarantee path (§5.4.5).
+
+        The event bus is fail-open and drop-oldest, so a dropped erasure event
+        would leave comments quoting an erased document in place — silently. This
+        poll is what the attestation actually counts, and it is how a service that
+        was down, or restored from a pre-erasure backup, converges.
+        """
+        if self.core is None:
+            return 0
+        done = 0
+        for tenant in tenants:
+            try:
+                pending = self.core.list_pending_erasures(
+                    ERASURE_PARTICIPANT, limit=limit, tenant=tenant)
+            except Exception as e:        # noqa: BLE001
+                log.warning("erasure sweep: could not list pending for %s: %s", tenant, e)
+                continue
+            for item in pending:
+                try:
+                    self._honour_erasure(tenant, item["uid"], item["erasure_id"])
+                    done += 1
+                except Exception:         # noqa: BLE001 — logged; keep sweeping
+                    continue
+        return done
 
     def handle(self, event: dict) -> None:
         if event.get("is_rendition"):
@@ -71,6 +142,12 @@ class EventConsumer:
             # A soft-deleted file must drop out of the activity feed/digest. Prune its
             # rows at the source so every reader is consistent; file.restored re-records.
             self.activity.delete_for_file(tenant, uid)
+        elif etype == "file.erased" and uid:
+            # Deliberately its own branch. file.deleted is a SOFT delete the core
+            # can reverse, so the threads survive and file.restored brings the
+            # activity back. This one is irreversible and the comment bodies —
+            # which quote the document — are exactly what has to go.
+            self._honour_erasure(tenant, uid, event.get("erasure_id", ""))
         elif etype == "acl.changed" and uid:
             self._invalidate("invalidate_resource", tenant, uid)
         elif etype in ("role.assigned", "role.member_removed"):
