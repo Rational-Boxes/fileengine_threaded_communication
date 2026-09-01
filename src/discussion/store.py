@@ -74,6 +74,18 @@ def _comment_select(prefix: str = "") -> str:
 _COMMENT_SELECT = _comment_select()
 
 
+class FileErasedError(RuntimeError):
+    """Raised when something tries to write discussion for an erased file.
+
+    Not a validation error: the file is gone by legal or contractual obligation,
+    and the only correct outcome is to refuse. Callers surface it as 410 Gone.
+    """
+
+    def __init__(self, file_uid: str):
+        super().__init__(f"file {file_uid} has been erased")
+        self.file_uid = file_uid
+
+
 class ThreadStore:
     def __init__(self, config: Config):
         self.config = config
@@ -82,6 +94,49 @@ class ThreadStore:
         return connect_for_tenant(self.config, tenant, provision=provision, readonly=readonly)
 
     # -- threads -------------------------------------------------------------
+    # ── Erasure (PROPOSAL_accountability_record.md §5.4) ────────────────────
+
+    def erase_file(self, tenant: str, file_uid: str, erasure_id: str = "") -> dict:
+        """Destroy every discussion artefact for a file, permanently, and tombstone it.
+
+        Comment bodies quote document content — that is what discussion is FOR —
+        so they are derived data in the sense §5.4.2 means, and an erasure that
+        left them would leave the erased document readable in quotation.
+
+        Deleting the threads cascades to comments, comment_revisions and
+        redactions. That last one is deliberate and worth naming: `redactions`
+        exists to retain pre-moderation content "forever", and this overrides it.
+        Two retention policies collide here and the legal erasure obligation is
+        the stronger — keeping the original body of a comment quoting an erased
+        document would defeat the erasure precisely where someone already judged
+        the text to need hiding.
+        """
+        with self._conn(tenant) as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM threads WHERE file_uid = %s", (file_uid,))
+            threads = cur.fetchone()[0]
+            cur.execute(
+                "SELECT count(*) FROM comments c JOIN threads t ON t.id = c.thread_id "
+                "WHERE t.file_uid = %s", (file_uid,))
+            comments = cur.fetchone()[0]
+
+            cur.execute("DELETE FROM threads WHERE file_uid = %s", (file_uid,))
+
+            # Same transaction as the destruction: split across two, a crash
+            # between them leaves the content gone and the uid un-tombstoned, so
+            # the next comment write re-creates a thread against an erased file.
+            cur.execute(
+                "INSERT INTO erased_files (file_uid, erasure_id) VALUES (%s, %s) "
+                "ON CONFLICT (file_uid) DO NOTHING",
+                (file_uid, erasure_id))
+            conn.commit()
+        return {"threads": threads, "comments": comments}
+
+    def is_erased(self, tenant: str, file_uid: str) -> bool:
+        """Has this file been erased? Checked before creating any thread."""
+        with self._conn(tenant) as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM erased_files WHERE file_uid = %s", (file_uid,))
+            return cur.fetchone() is not None
+
     def create_thread(self, tenant: str, *, file_uid: str, version: str, title: str,
                       body: str, body_text: str, opened_by: str,
                       anchor: Optional[dict] = None, markup: Optional[dict] = None) -> dict:
@@ -93,6 +148,14 @@ class ThreadStore:
         stored as JSONB on the opening comment; None = no attached markup."""
         tid, cid = _uid(), _uid()
         with self._conn(tenant, provision=True) as conn, conn.cursor() as cur:
+            # An erasure may have landed between the client opening the composer
+            # and posting. Writing anyway would put quoted document content back
+            # after the platform recorded the erasure complete — the late-write
+            # race (§5.4.5). Checked inside the same transaction as the insert,
+            # so the tombstone cannot land between the check and the write.
+            cur.execute("SELECT 1 FROM erased_files WHERE file_uid = %s", (file_uid,))
+            if cur.fetchone() is not None:
+                raise FileErasedError(file_uid)
             cur.execute(
                 "INSERT INTO threads (id, file_uid, version, title, opened_by, anchor) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",

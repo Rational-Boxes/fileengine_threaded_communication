@@ -141,6 +141,14 @@ class Config:
         self.redis_port = _int("FILEENGINE_REDIS_PORT", 6379)
         self.redis_password = _env("FILEENGINE_REDIS_PASSWORD", "")
         self.redis_db = _int("FILEENGINE_REDIS_DB", 0)
+        # Erasure guarantee path (§5.4.5). The interval is short enough that an
+        # unmet obligation is not left sitting and long enough that it costs
+        # nothing. The tenant list is explicit because this service has no
+        # authoritative view of the tenant set, and guessing wrong in the quiet
+        # direction would leave erasures unacknowledged with nothing saying so.
+        self.erasure_sweep_interval_s = int(_env("DISCUSSION_ERASURE_SWEEP_INTERVAL_S", "60"))
+        self.erasure_sweep_tenants = _env("DISCUSSION_ERASURE_SWEEP_TENANTS", "")
+
         self.events_stream = _env("FILEENGINE_EVENTS_STREAM", "fileengine:events")
         self.events_group = _env("DISC_EVENTS_GROUP", "discussion")
         self.emits_stream = _env("DISC_EMITS_STREAM", "discussion:events")

@@ -34,10 +34,15 @@ class FakeActivity:
 class FakeStore:
     def __init__(self):
         self.stale = []
+        self.erased = []
 
     def mark_anchor_stale(self, tenant, file_uid, new_version):
         self.stale.append((tenant, file_uid, new_version))
         return 1
+
+    def erase_file(self, tenant, file_uid, erasure_id=""):
+        self.erased.append((tenant, file_uid, erasure_id))
+        return {"threads": 2, "comments": 5}
 
 
 class FakePerms:
@@ -54,9 +59,32 @@ class FakePerms:
         self.calls.append(("tenant", t))
 
 
-def _mk():
+class FakeCore:
+    def __init__(self, pending=None, fail=False):
+        self._pending = pending or {}
+        self.acks = []
+        self.fail = fail
+
+    def list_pending_erasures(self, participant, limit=0, tenant=None, all_tenants=True):
+        # The real sweep asks for EVERY tenant in one call and reads the tenant
+        # off each row; a per-tenant fake would keep passing a sweep that had
+        # gone back to guessing.
+        assert all_tenants, "the sweep must ask for all tenants"
+        return [{**it, "tenant": t} for t, items in self._pending.items() for it in items]
+
+    def acknowledge_erasure(self, erasure_id, participant, complied=True, detail="",
+                            tenant=None):
+        if self.fail:
+            raise RuntimeError("core unreachable")
+        self.acks.append({"erasure_id": erasure_id, "participant": participant,
+                          "complied": complied, "detail": detail})
+        return "complete"
+
+
+def _mk(core=None):
     a, s, p = FakeActivity(), FakeStore(), FakePerms()
-    return EventConsumer(None, activity=a, store=s, permissions=p), a, s, p
+    return (EventConsumer(None, activity=a, store=s, permissions=p, core=core),
+            a, s, p)
 
 
 def test_file_created_records_activity():
@@ -185,3 +213,99 @@ def test_a_drop_is_not_notified_twice_by_its_file_created():
               "actor": "alice", "name": "plans.pdf"})
     assert n.rows == []
     assert a.records  # ...but it did record activity
+
+
+# ── Erasure (PROPOSAL_accountability_record.md §5.4) ────────────────────────
+
+def test_erasure_destroys_the_discussion_rather_than_pruning_the_feed():
+    """file.erased must not behave like file.deleted.
+
+    A soft delete only drops the file out of the activity feed; the threads
+    survive because file.restored brings them back. An erasure is irreversible
+    and the comment bodies — which quote the document — are exactly what has to
+    go, so sharing that branch would leave the erased content readable in
+    quotation.
+    """
+    core = FakeCore()
+    c, a, s, p = _mk(core)
+
+    c.handle({"type": "file.deleted", "tenant": "t1", "file_uid": "f1"})
+    assert s.erased == [], "a soft delete must not destroy threads"
+
+    c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f2",
+              "erasure_id": "e2"})
+    assert s.erased == [("t1", "f2", "e2")]
+    assert ("t1", "f2") in a.deleted
+
+
+def test_the_acknowledgement_states_what_was_destroyed():
+    core = FakeCore()
+    c, a, s, p = _mk(core)
+    c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f1",
+              "erasure_id": "e1"})
+
+    assert len(core.acks) == 1
+    ack = core.acks[0]
+    assert ack["participant"] == "discussion"
+    assert ack["complied"] is True
+    assert "2 thread(s)" in ack["detail"] and "5 comment(s)" in ack["detail"]
+    # Naming the pre-redaction bodies matters: `redactions` is documented as
+    # retained forever, and an auditor needs to see that erasure overrode it.
+    assert "pre-redaction" in ack["detail"]
+
+
+def test_a_failure_is_acknowledged_as_a_failure():
+    core = FakeCore()
+    c, a, s, p = _mk(core)
+
+    def boom(tenant, file_uid, erasure_id=""):
+        raise RuntimeError("nope")
+    s.erase_file = boom
+
+    try:
+        c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f1",
+                  "erasure_id": "e1"})
+    except RuntimeError:
+        pass
+    assert core.acks and core.acks[0]["complied"] is False
+
+
+def test_a_lost_acknowledgement_leaves_the_data_destroyed():
+    core = FakeCore(fail=True)
+    c, a, s, p = _mk(core)
+    c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f1",
+              "erasure_id": "e1"})
+    assert s.erased == [("t1", "f1", "e1")]
+
+
+def test_the_sweep_catches_what_the_event_bus_dropped():
+    # fileengine:events is fail-open and drop-oldest by design, so without this
+    # a dropped event leaves comments quoting an erased document in place.
+    core = FakeCore(pending={"t1": [{"erasure_id": "e9", "uid": "u9", "initiated_at": 1}]})
+    c, a, s, p = _mk(core)
+    assert c.sweep_erasures([]) == 1
+    assert s.erased == [("t1", "u9", "e9")]
+    assert core.acks[0]["erasure_id"] == "e9"
+
+
+def test_without_a_core_client_the_data_is_still_destroyed():
+    # Unacknowledged is visible and the sweep retries; silently-uncomplied is not.
+    c, a, s, p = _mk(core=None)
+    c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f1",
+              "erasure_id": "e1"})
+    assert s.erased == [("t1", "f1", "e1")]
+
+
+def test_the_sweep_reaches_a_tenant_this_consumer_was_never_told_about():
+    """The failure this replaced: a configured tenant list that defaulted to one.
+
+    An erasure recorded in a tenant absent from that list sat unacknowledged for
+    ever, and nothing said so. Verified in production: an erasure in
+    `filenginetest` was ignored by this service and by difference, both of which
+    had guessed `default`.
+    """
+    core = FakeCore(pending={"never-configured": [{"erasure_id": "e1", "uid": "u1",
+                                                   "initiated_at": 1}]})
+    c, a, s, p = _mk(core)
+    assert c.sweep_erasures([]) == 1
+    assert s.erased == [("never-configured", "u1", "e1")]

@@ -106,6 +106,20 @@ CREATE TABLE IF NOT EXISTS "{schema}".redactions (
     redacted_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Erasure tombstones (PROPOSAL_accountability_record.md §5.4.5).
+--
+-- An erasure can arrive while a comment is being posted against the same file.
+-- Purging and then letting that write land puts quoted document content straight
+-- back, after the erasure was recorded complete. Destroying what exists is only
+-- half the job; refusing to write for the uid thereafter is the half that
+-- actually closes the race. Rows are permanent — they are tiny, and expiring
+-- them would reopen exactly that window.
+CREATE TABLE IF NOT EXISTS "{schema}".erased_files (
+    file_uid   TEXT PRIMARY KEY,
+    erasure_id TEXT NOT NULL DEFAULT '',
+    erased_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS "{schema}".mentions (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     comment_id  TEXT NOT NULL REFERENCES "{schema}".comments (id) ON DELETE CASCADE,

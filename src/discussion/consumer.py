@@ -43,8 +43,15 @@ _ACTIVITY = {"file.created": "created", "file.updated": "updated", "file.restore
 Entry = Tuple[str, dict]
 
 
+# The name this service acknowledges erasures under; must match the core's
+# FILEENGINE_ERASURE_PARTICIPANTS entry, or the core waits forever for an
+# acknowledgement filed under a name it is not looking for.
+ERASURE_PARTICIPANT = "discussion"
+
+
 class EventConsumer:
-    def __init__(self, config, *, activity, store, permissions, notifications=None):
+    def __init__(self, config, *, activity, store, permissions, notifications=None,
+                 core=None):
         self.config = config
         self.activity = activity
         self.store = store
@@ -52,6 +59,81 @@ class EventConsumer:
         # Optional so existing constructions (and tests) keep working; a share
         # event with no store logs and moves on rather than crashing the loop.
         self.notifications = notifications
+        # Optional so existing constructions and tests need not grow a gRPC
+        # dependency they do not use. Without it an erasure is still honoured
+        # locally — the data is destroyed — but cannot be acknowledged, so the
+        # core keeps offering it and the sweep will retry. That is the safe
+        # direction: unacknowledged is visible, silently-uncomplied is not.
+        self.core = core
+
+    # ── Erasure (PROPOSAL_accountability_record.md §5.4) ────────────────────
+
+    def _honour_erasure(self, tenant: str, uid: str, erasure_id: str = "") -> None:
+        """Destroy this file's discussion, then say so — or say plainly that we could not."""
+        try:
+            counts = self.store.erase_file(tenant, uid, erasure_id)
+            self.activity.delete_for_file(tenant, uid)
+        except Exception as e:            # noqa: BLE001 — the reason must reach the record
+            log.error("erasure %s: could not destroy discussion for %s: %s",
+                      erasure_id or "(event)", uid, e)
+            self._acknowledge(tenant, erasure_id, False, f"destroy failed: {e}")
+            raise
+        log.info("erased discussion for %s (threads=%s, comments=%s)",
+                 uid, counts["threads"], counts["comments"])
+        self._acknowledge(
+            tenant, erasure_id, True,
+            f"destroyed {counts['threads']} thread(s), {counts['comments']} comment(s), "
+            "revisions and pre-redaction bodies")
+
+    def _acknowledge(self, tenant: str, erasure_id: str, complied: bool, detail: str) -> None:
+        if not erasure_id or self.core is None:
+            return
+        try:
+            state = self.core.acknowledge_erasure(
+                erasure_id, ERASURE_PARTICIPANT, complied=complied, detail=detail,
+                tenant=tenant)
+            log.info("acknowledged erasure %s (complied=%s) -> %s", erasure_id, complied, state)
+        except Exception as e:            # noqa: BLE001
+            # The destruction already committed. A lost ack delays completion,
+            # which is the safe direction; the sweep re-offers it.
+            log.warning("erasure %s destroyed locally but ack failed: %s", erasure_id, e)
+
+    def sweep_erasures(self, tenants, limit: int = 100) -> int:
+        """The guarantee path (§5.4.5).
+
+        The event bus is fail-open and drop-oldest, so a dropped erasure event
+        would leave comments quoting an erased document in place — silently. This
+        poll is what the attestation actually counts, and it is how a service that
+        was down, or restored from a pre-erasure backup, converges.
+        """
+        if self.core is None:
+            return 0
+        # ONE call, across every tenant. `tenants` is accepted for callers that
+        # want to narrow it, but the default is all of them: guessing the tenant
+        # set from local activity or config was wrong in the quiet direction —
+        # an erasure in a tenant we had not been told about sat unacknowledged
+        # for ever, with nothing saying so. The core is the authority.
+        try:
+            pending = self.core.list_pending_erasures(ERASURE_PARTICIPANT, limit=limit,
+                                                      all_tenants=True)
+        except Exception as e:            # noqa: BLE001
+            log.warning("erasure sweep: could not list pending erasures: %s", e)
+            return 0
+
+        wanted = set(tenants or [])
+        done = 0
+        for item in pending:
+            # The tenant the ROW carries. Acknowledging into the wrong schema
+            # would leave the real erasure outstanding while looking answered.
+            tenant = item.get("tenant") or "default"
+            if wanted and tenant not in wanted:
+                continue
+            try:
+                self._honour_erasure(tenant, item["uid"], item["erasure_id"])
+                done += 1
+            except Exception:             # noqa: BLE001 — logged; keep sweeping
+                continue
+        return done
 
     def handle(self, event: dict) -> None:
         if event.get("is_rendition"):
@@ -71,6 +153,12 @@ class EventConsumer:
             # A soft-deleted file must drop out of the activity feed/digest. Prune its
             # rows at the source so every reader is consistent; file.restored re-records.
             self.activity.delete_for_file(tenant, uid)
+        elif etype == "file.erased" and uid:
+            # Deliberately its own branch. file.deleted is a SOFT delete the core
+            # can reverse, so the threads survive and file.restored brings the
+            # activity back. This one is irreversible and the comment bodies —
+            # which quote the document — are exactly what has to go.
+            self._honour_erasure(tenant, uid, event.get("erasure_id", ""))
         elif etype == "acl.changed" and uid:
             self._invalidate("invalidate_resource", tenant, uid)
         elif etype in ("role.assigned", "role.member_removed"):
@@ -133,9 +221,54 @@ class EventConsumer:
         except Exception:
             log.warning("cache invalidation (%s) failed", method, exc_info=True)
 
+    def _start_erasure_sweeper(self) -> None:
+        """Poll for erasures we owe, forever, in a daemon thread. Never fatal."""
+        # getattr, not self.core: run_forever is exercised against a bare
+        # EventConsumer.__new__ in the resilience tests, which have no __init__
+        # and so no attributes. The sweeper must not be what breaks that — it is
+        # an addition to the loop, not a precondition for it.
+        if getattr(self, "core", None) is None:
+            log.warning("erasure sweeper not started: no core client")
+            return
+        import threading
+
+        interval = int(getattr(self.config, "erasure_sweep_interval_s", 60) or 60)
+
+        def loop() -> None:
+            while True:
+                try:
+                    done = self.sweep_erasures([])
+                    if done:
+                        log.info("erasure sweep honoured %d outstanding erasure(s)", done)
+                except Exception:
+                    log.exception("erasure sweep failed; retrying next tick")
+                time.sleep(interval)
+
+        threading.Thread(target=loop, name="erasure-sweep", daemon=True).start()
+        log.info("erasure sweeper started (every %ss, participant=%s)",
+                 interval, ERASURE_PARTICIPANT)
+
+    def _tenants_for_sweep(self) -> list:
+        """Tenants to poll. Configured list, else the default tenant alone.
+
+        Deliberately explicit rather than discovered: this service has no
+        authoritative view of the tenant set, and guessing wrong in the quiet
+        direction (missing a tenant) would leave erasures unacknowledged with
+        nothing saying so.
+        """
+        raw = getattr(self.config, "erasure_sweep_tenants", "") or ""
+        tenants = [t.strip() for t in raw.split(",") if t.strip()]
+        return tenants or [getattr(self.config, "default_tenant", "default") or "default"]
+
     # ------------------------------ run loop -------------------------------
     def run_forever(self, source) -> None:
         source.ensure_group()
+        # The erasure guarantee path (§5.4.5), on a timer beside the event loop.
+        # The event that triggers a purge is fail-open and drop-oldest by design,
+        # so a dropped one would leave comments quoting an erased document in
+        # place — silently. In a thread rather than folded into the loop below,
+        # which blocks on a read for seconds at a time.
+        self._start_erasure_sweeper()
         while True:
             # The whole CYCLE is guarded, not just handle(). Only the per-event
             # work used to be, so anything raised by source.read() or ack() — a
@@ -261,9 +394,22 @@ def main() -> None:
     _l.basicConfig(level=_l.INFO)
     load_dotenv()
     config = Config()
+    # A core client, so erasures can actually be ACKNOWLEDGED. Without one the
+    # data is still destroyed but the core is never told, so every erasure this
+    # service participates in stays outstanding for ever — an alarm that means
+    # nothing because it is always ringing.
+    try:
+        from .core_client import agent_client
+        core = agent_client(config)
+    except Exception:               # noqa: BLE001
+        core = None
+        log.warning("no core client: erasures will be honoured but not acknowledged",
+                    exc_info=True)
+
     consumer = EventConsumer(config, activity=ActivityStore(config), store=ThreadStore(config),
                              permissions=Permissions(config),
-                             notifications=NotificationStore(config))
+                             notifications=NotificationStore(config),
+                             core=core)
     log.info("discussion consumer — stream=%s group=%s", config.events_stream, config.events_group)
     consumer.run_forever(RedisEventSource(config))
 
