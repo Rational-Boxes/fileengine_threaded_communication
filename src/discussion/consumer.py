@@ -108,20 +108,31 @@ class EventConsumer:
         """
         if self.core is None:
             return 0
+        # ONE call, across every tenant. `tenants` is accepted for callers that
+        # want to narrow it, but the default is all of them: guessing the tenant
+        # set from local activity or config was wrong in the quiet direction —
+        # an erasure in a tenant we had not been told about sat unacknowledged
+        # for ever, with nothing saying so. The core is the authority.
+        try:
+            pending = self.core.list_pending_erasures(ERASURE_PARTICIPANT, limit=limit,
+                                                      all_tenants=True)
+        except Exception as e:            # noqa: BLE001
+            log.warning("erasure sweep: could not list pending erasures: %s", e)
+            return 0
+
+        wanted = set(tenants or [])
         done = 0
-        for tenant in tenants:
-            try:
-                pending = self.core.list_pending_erasures(
-                    ERASURE_PARTICIPANT, limit=limit, tenant=tenant)
-            except Exception as e:        # noqa: BLE001
-                log.warning("erasure sweep: could not list pending for %s: %s", tenant, e)
+        for item in pending:
+            # The tenant the ROW carries. Acknowledging into the wrong schema
+            # would leave the real erasure outstanding while looking answered.
+            tenant = item.get("tenant") or "default"
+            if wanted and tenant not in wanted:
                 continue
-            for item in pending:
-                try:
-                    self._honour_erasure(tenant, item["uid"], item["erasure_id"])
-                    done += 1
-                except Exception:         # noqa: BLE001 — logged; keep sweeping
-                    continue
+            try:
+                self._honour_erasure(tenant, item["uid"], item["erasure_id"])
+                done += 1
+            except Exception:             # noqa: BLE001 — logged; keep sweeping
+                continue
         return done
 
     def handle(self, event: dict) -> None:
@@ -226,8 +237,7 @@ class EventConsumer:
         def loop() -> None:
             while True:
                 try:
-                    tenants = self._tenants_for_sweep()
-                    done = self.sweep_erasures(tenants)
+                    done = self.sweep_erasures([])
                     if done:
                         log.info("erasure sweep honoured %d outstanding erasure(s)", done)
                 except Exception:

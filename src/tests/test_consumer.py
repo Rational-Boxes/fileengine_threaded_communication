@@ -65,8 +65,12 @@ class FakeCore:
         self.acks = []
         self.fail = fail
 
-    def list_pending_erasures(self, participant, limit=0, tenant=None):
-        return list(self._pending.get(tenant, []))
+    def list_pending_erasures(self, participant, limit=0, tenant=None, all_tenants=True):
+        # The real sweep asks for EVERY tenant in one call and reads the tenant
+        # off each row; a per-tenant fake would keep passing a sweep that had
+        # gone back to guessing.
+        assert all_tenants, "the sweep must ask for all tenants"
+        return [{**it, "tenant": t} for t, items in self._pending.items() for it in items]
 
     def acknowledge_erasure(self, erasure_id, participant, complied=True, detail="",
                             tenant=None):
@@ -277,10 +281,9 @@ def test_a_lost_acknowledgement_leaves_the_data_destroyed():
 def test_the_sweep_catches_what_the_event_bus_dropped():
     # fileengine:events is fail-open and drop-oldest by design, so without this
     # a dropped event leaves comments quoting an erased document in place.
-    core = FakeCore(pending={"t1": [{"erasure_id": "e9", "uid": "u9",
-                                     "tenant": "t1", "initiated_at": 1}]})
+    core = FakeCore(pending={"t1": [{"erasure_id": "e9", "uid": "u9", "initiated_at": 1}]})
     c, a, s, p = _mk(core)
-    assert c.sweep_erasures(["t1"]) == 1
+    assert c.sweep_erasures([]) == 1
     assert s.erased == [("t1", "u9", "e9")]
     assert core.acks[0]["erasure_id"] == "e9"
 
@@ -291,3 +294,18 @@ def test_without_a_core_client_the_data_is_still_destroyed():
     c.handle({"type": "file.erased", "tenant": "t1", "file_uid": "f1",
               "erasure_id": "e1"})
     assert s.erased == [("t1", "f1", "e1")]
+
+
+def test_the_sweep_reaches_a_tenant_this_consumer_was_never_told_about():
+    """The failure this replaced: a configured tenant list that defaulted to one.
+
+    An erasure recorded in a tenant absent from that list sat unacknowledged for
+    ever, and nothing said so. Verified in production: an erasure in
+    `filenginetest` was ignored by this service and by difference, both of which
+    had guessed `default`.
+    """
+    core = FakeCore(pending={"never-configured": [{"erasure_id": "e1", "uid": "u1",
+                                                   "initiated_at": 1}]})
+    c, a, s, p = _mk(core)
+    assert c.sweep_erasures([]) == 1
+    assert s.erased == [("never-configured", "u1", "e1")]
