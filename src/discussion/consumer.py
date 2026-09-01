@@ -210,9 +210,55 @@ class EventConsumer:
         except Exception:
             log.warning("cache invalidation (%s) failed", method, exc_info=True)
 
+    def _start_erasure_sweeper(self) -> None:
+        """Poll for erasures we owe, forever, in a daemon thread. Never fatal."""
+        # getattr, not self.core: run_forever is exercised against a bare
+        # EventConsumer.__new__ in the resilience tests, which have no __init__
+        # and so no attributes. The sweeper must not be what breaks that — it is
+        # an addition to the loop, not a precondition for it.
+        if getattr(self, "core", None) is None:
+            log.warning("erasure sweeper not started: no core client")
+            return
+        import threading
+
+        interval = int(getattr(self.config, "erasure_sweep_interval_s", 60) or 60)
+
+        def loop() -> None:
+            while True:
+                try:
+                    tenants = self._tenants_for_sweep()
+                    done = self.sweep_erasures(tenants)
+                    if done:
+                        log.info("erasure sweep honoured %d outstanding erasure(s)", done)
+                except Exception:
+                    log.exception("erasure sweep failed; retrying next tick")
+                time.sleep(interval)
+
+        threading.Thread(target=loop, name="erasure-sweep", daemon=True).start()
+        log.info("erasure sweeper started (every %ss, participant=%s)",
+                 interval, ERASURE_PARTICIPANT)
+
+    def _tenants_for_sweep(self) -> list:
+        """Tenants to poll. Configured list, else the default tenant alone.
+
+        Deliberately explicit rather than discovered: this service has no
+        authoritative view of the tenant set, and guessing wrong in the quiet
+        direction (missing a tenant) would leave erasures unacknowledged with
+        nothing saying so.
+        """
+        raw = getattr(self.config, "erasure_sweep_tenants", "") or ""
+        tenants = [t.strip() for t in raw.split(",") if t.strip()]
+        return tenants or [getattr(self.config, "default_tenant", "default") or "default"]
+
     # ------------------------------ run loop -------------------------------
     def run_forever(self, source) -> None:
         source.ensure_group()
+        # The erasure guarantee path (§5.4.5), on a timer beside the event loop.
+        # The event that triggers a purge is fail-open and drop-oldest by design,
+        # so a dropped one would leave comments quoting an erased document in
+        # place — silently. In a thread rather than folded into the loop below,
+        # which blocks on a read for seconds at a time.
+        self._start_erasure_sweeper()
         while True:
             # The whole CYCLE is guarded, not just handle(). Only the per-event
             # work used to be, so anything raised by source.read() or ack() — a
@@ -338,9 +384,22 @@ def main() -> None:
     _l.basicConfig(level=_l.INFO)
     load_dotenv()
     config = Config()
+    # A core client, so erasures can actually be ACKNOWLEDGED. Without one the
+    # data is still destroyed but the core is never told, so every erasure this
+    # service participates in stays outstanding for ever — an alarm that means
+    # nothing because it is always ringing.
+    try:
+        from .core_client import agent_client
+        core = agent_client(config)
+    except Exception:               # noqa: BLE001
+        core = None
+        log.warning("no core client: erasures will be honoured but not acknowledged",
+                    exc_info=True)
+
     consumer = EventConsumer(config, activity=ActivityStore(config), store=ThreadStore(config),
                              permissions=Permissions(config),
-                             notifications=NotificationStore(config))
+                             notifications=NotificationStore(config),
+                             core=core)
     log.info("discussion consumer — stream=%s group=%s", config.events_stream, config.events_group)
     consumer.run_forever(RedisEventSource(config))
 
