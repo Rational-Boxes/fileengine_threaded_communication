@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from discussion.app import build_app
 from discussion.config import Config
 from discussion.ldap_auth import Identity
+from discussion.targets import validate_targets
 
 
 # ------------------------------- fakes -------------------------------------
@@ -159,9 +160,14 @@ class FakePerms:
     """reads/writes/live: True (all), None (none), or a set of allowed file_uids.
     deny_users: uids denied READ regardless (to exercise mention error-marking).
     live: which file_uids are still present (not soft-deleted); True = all live."""
-    def __init__(self, reads=True, writes=None, deny_users=frozenset(), live=True):
+    def __init__(self, reads=True, writes=None, deny_users=frozenset(), live=True,
+                 file_tenant=None):
         self.reads, self.writes, self.deny_users = reads, writes, set(deny_users)
         self.live = live
+        # Which tenant the anchor lives in. The real check scopes its core client
+        # by identity.tenant, so a principal stamped with the wrong tenant asks a
+        # schema the file is not in and is refused. None = don't model it.
+        self.file_tenant = file_tenant
 
     @staticmethod
     def _ok(allow, file_uid):
@@ -170,6 +176,8 @@ class FakePerms:
     def can_read(self, ident, file_uid):
         if ident.user in self.deny_users:
             return False
+        if self.file_tenant is not None and ident.tenant != self.file_tenant:
+            return False        # wrong schema — exactly the production failure
         return self._ok(self.reads, file_uid)
 
     def can_write(self, ident, file_uid):
@@ -180,17 +188,24 @@ class FakePerms:
 
 
 class FakeDirectory:
+    """Stamps the tenant it is ASKED for, as the real directory does.
+
+    It used to hard-code "default", which is why the tenant defect was invisible
+    here: the fake answered in the configured tenant no matter what the request
+    said, and FakePerms did not look at the tenant at all. Between them they
+    modelled the one arrangement in which the bug cannot appear."""
     def __init__(self, mapping=None):
         # identifier -> uid; unknown identifiers resolve to None.
         self.mapping = mapping or {}
 
-    def resolve_principal(self, identifier):
+    def resolve_principal(self, identifier, tenant=None):
         uid = self.mapping.get(identifier)
-        return None if uid is None else Identity(user=uid, roles=["users"], tenant="default")
+        return None if uid is None else Identity(user=uid, roles=["users"],
+                                                 tenant=tenant or "default")
 
-    def search(self, q, limit=8):
+    def search(self, q, limit=8, tenant=None):
         ql = (q or "").lower()
-        out = [Identity(user=uid, roles=["users"], tenant="default", email=ident)
+        out = [Identity(user=uid, roles=["users"], tenant=tenant or "default", email=ident)
                for ident, uid in self.mapping.items()
                if ql in ident.lower() or ql in uid.lower()]
         return out[:limit]
@@ -262,11 +277,13 @@ def make(monkeypatch):
     monkeypatch.setattr("discussion.api.authenticate", _fake_auth)
     monkeypatch.setattr("discussion.http_auth.authenticate", _fake_auth)
 
-    def _make(reads=True, writes=None, deny_users=frozenset(), directory=None):
+    def _make(reads=True, writes=None, deny_users=frozenset(), directory=None,
+              file_tenant=None):
         store, notes, events, indexer = FakeStore(), FakeNotes(), FakeEvents(), FakeIndexer()
         directory = directory or FakeDirectory()
         app = build_app(Config(), store=store,
-                        permissions=FakePerms(reads=reads, writes=writes, deny_users=deny_users),
+                        permissions=FakePerms(reads=reads, writes=writes, deny_users=deny_users,
+                                              file_tenant=file_tenant),
                         directory=directory, events=events, notifications=notes,
                         reviews=object(), indexer=indexer)
         return Ctx(TestClient(app), store, notes, events, directory, indexer)
@@ -445,6 +462,45 @@ def test_mentionable_autocomplete(make):
     # A candidate who can't read the file is filtered out.
     c2 = make(reads=True, deny_users={"carol"}, directory=FakeDirectory({"carol@x": "carol"}))
     assert c2.client.get("/files/f1/mentionable?q=car", headers=_auth("bob")).json()["users"] == []
+
+
+# --- the tenant the check runs in (production defect, 2026-09-05) -----------
+#
+# Both halves of @mention resolved the target into the SERVICE's configured
+# tenant instead of the request's, so the READ check asked a schema the file was
+# not in. On the deployment (configured tenant `default`, users in `arcdigital`)
+# autocomplete answered 200 with an empty list — indistinguishable from "nobody
+# matched" — and posting a mention failed 422. It worked only on the one tenant
+# that happened to match the config, which is the tenant every test used.
+TENANT_HDR = {"X-Tenant": "arcdigital"}
+
+
+def test_mentionable_resolves_in_the_requested_tenant(make):
+    c = make(reads=True, file_tenant="arcdigital",
+             directory=FakeDirectory({"carol@x": "carol"}))
+    r = c.client.get("/files/f1/mentionable?q=car",
+                     headers={**_auth("bob"), **TENANT_HDR})
+    assert r.status_code == 200
+    assert [u["user"] for u in r.json()["users"]] == ["carol"]
+
+
+def test_mention_can_be_posted_in_a_non_default_tenant(make):
+    c = make(reads=True, file_tenant="arcdigital",
+             directory=FakeDirectory({"carol@x": "carol"}))
+    r = c.client.post("/files/f1/threads",
+                      json={"body": "look at this @carol@x", "mentions": ["carol@x"]},
+                      headers={**_auth("bob"), **TENANT_HDR})
+    assert r.status_code == 201, r.json()          # not 422 "cannot access this file"
+    assert c.notes.kinds_for("carol") == ["mention"]   # ...and they are flagged
+
+
+def test_reviewers_resolve_in_the_requested_tenant(make):
+    # Same primitive, same defect: the reviewer picker filters by who-can-read.
+    c = make(reads=True, file_tenant="arcdigital",
+             directory=FakeDirectory({"carol@x": "carol"}))
+    valid, invalid = validate_targets(c.directory, FakePerms(reads=True, file_tenant="arcdigital"),
+                                      "f1", ["carol@x"], "arcdigital")
+    assert invalid == [] and [p.user for _i, p in valid] == ["carol"]
 
 
 def test_thread_provenance_endpoint(make):

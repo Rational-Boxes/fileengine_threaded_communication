@@ -23,6 +23,16 @@ service-bind group lookup (no bind as the user), so we can resolve a principal
 
 Returns an Identity with ``authenticated=False`` (we did not authenticate them —
 only resolved their identity for an ACL check). ``None`` if not found / unreachable.
+
+THE TENANT IS A PARAMETER, not the service's configured one. The resolved
+principal is handed straight to ``Permissions.can_read``, which scopes its core
+client by ``identity.tenant`` — so stamping the config's tenant asked the wrong
+schema whenever the request was for any other tenant. The answer was False for
+everyone, including the caller reading the file at that moment, and an empty
+list is indistinguishable from "nobody matched": @mention autocomplete returned
+200 with no users on every tenant but the configured one, and posting a mention
+there failed 422 "cannot access this file". Measured on the deployment, where
+the configured tenant is `default` and the users were in `arcdigital`.
 """
 from __future__ import annotations
 
@@ -41,7 +51,10 @@ class Directory:
     def __init__(self, config):
         self.config = config
 
-    def resolve_principal(self, identifier: str) -> Optional[Identity]:
+    def resolve_principal(self, identifier: str,
+                          tenant: Optional[str] = None) -> Optional[Identity]:
+        """Resolve one identifier to a principal, scoped to ``tenant`` (default:
+        the configured one) so the caller's ACL check runs in the right schema."""
         cfg = self.config
         identifier = (identifier or "").strip()
         if not identifier:
@@ -75,17 +88,20 @@ class Directory:
             if "administrators" in roles and "system_admin" not in roles:
                 roles.append("system_admin")
 
-            return Identity(user=uid, roles=roles, tenant=cfg.tenant, authenticated=False, email=email)
+            return Identity(user=uid, roles=roles, tenant=tenant or cfg.tenant,
+                            authenticated=False, email=email)
         except LDAPException:
             log.warning("directory: lookup failed for %s", identifier, exc_info=True)
             return None
         finally:
             svc.unbind()
 
-    def search(self, query: str, limit: int = 8) -> list[Identity]:
+    def search(self, query: str, limit: int = 8,
+               tenant: Optional[str] = None) -> list[Identity]:
         """Candidate users matching ``query`` (uid/email/name substring), with roles
         resolved — for @mention autocomplete. The caller ACL-filters by the anchor
-        (§5.1). Returns [] on empty query or an unreachable directory."""
+        (§5.1), which is why ``tenant`` matters here: it is the tenant that filter
+        runs in. Returns [] on empty query or an unreachable directory."""
         cfg = self.config
         q = (query or "").strip()
         if not q:
@@ -115,7 +131,7 @@ class Directory:
                         roles.append(cn)
                 if "administrators" in roles and "system_admin" not in roles:
                     roles.append("system_admin")
-                out.append(Identity(user=uid, roles=roles, tenant=cfg.tenant,
+                out.append(Identity(user=uid, roles=roles, tenant=tenant or cfg.tenant,
                                     authenticated=False, email=email))
         except LDAPException:
             log.warning("directory: search failed for %s", q, exc_info=True)
