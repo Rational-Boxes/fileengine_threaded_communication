@@ -104,13 +104,14 @@ async def _live(request: Request, tenant: str, file_uid: str, message: dict) -> 
         pass
 
 
-async def _validate_mentions(request: Request, file_uid: str, mentions):
+async def _validate_mentions(request: Request, file_uid: str, mentions, tenant: str = ""):
     """Resolve + READ-check each mention target; 422 if any lack access (§5.1).
     Returns the list of valid ``(identifier, principal)`` for persistence."""
     if not mentions:
         return []
     valid, invalid = await run_in_threadpool(
-        validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid, mentions)
+        validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid,
+        mentions, tenant)
     if invalid:
         raise HTTPException(status_code=422,
                             detail={"error": "some mentioned users cannot access this file",
@@ -162,7 +163,8 @@ async def open_thread(file_uid: str, request: Request, body: dict = Body(...),
     # Opaque to the service; the frontend PDF viewer interprets it. None = no markup.
     markup = (body or {}).get("markup") or None
     # Validate the opening comment's mentions *before* creating the thread (§5.1).
-    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
+    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [],
+                                     ident.tenant)
 
     thread = await run_in_threadpool(partial(
         _s(request, "store").create_thread, ident.tenant, file_uid=file_uid, version=version,
@@ -282,7 +284,8 @@ async def add_comment(thread_id: str, request: Request, body: dict = Body(...),
 
     # Validate mentions *before* writing (§5.1): any target lacking READ error-marks
     # the whole submit so the author can fix and resubmit — no partial mention.
-    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [])
+    valid = await _validate_mentions(request, file_uid, (body or {}).get("mentions") or [],
+                                     ident.tenant)
 
     comment = await run_in_threadpool(partial(
         store.add_comment, ident.tenant, thread_id, author=ident.user,
@@ -342,10 +345,13 @@ async def comment_revisions(comment_id: str, request: Request,
     return {"revisions": revisions}
 
 
-def _mentionable_readers(directory, perms, file_uid: str, q: str) -> list[dict]:
-    """LDAP search + ACL filter, run as one blocking unit off the event loop."""
+def _mentionable_readers(directory, perms, file_uid: str, q: str, tenant: str) -> list[dict]:
+    """LDAP search + ACL filter, run as one blocking unit off the event loop.
+
+    ``tenant`` scopes both halves: the candidates are stamped with it, and the
+    READ check therefore asks the right tenant's schema."""
     return [{"user": c.user, "email": c.email}
-            for c in directory.search(q, 8) if perms.can_read(c, file_uid)]
+            for c in directory.search(q, 8, tenant=tenant) if perms.can_read(c, file_uid)]
 
 
 @router.get("/files/{file_uid}/mentionable")
@@ -355,7 +361,8 @@ async def mentionable(file_uid: str, request: Request, q: str = Query(..., min_l
     The caller must be able to READ it too."""
     await _require(request, ident, file_uid, "r")
     users = await run_in_threadpool(
-        _mentionable_readers, _s(request, "directory"), _s(request, "permissions"), file_uid, q)
+        _mentionable_readers, _s(request, "directory"), _s(request, "permissions"), file_uid, q,
+        ident.tenant)
     return {"users": users}
 
 

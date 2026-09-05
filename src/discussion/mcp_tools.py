@@ -118,7 +118,8 @@ class Toolset:
 
         valid = []
         if mentions:
-            valid, invalid = validate_targets(self.c.directory, self.c.permissions, file_uid, mentions)
+            valid, invalid = validate_targets(self.c.directory, self.c.permissions, file_uid, mentions,
+                                             ident.tenant)
             if invalid:
                 raise ToolError("some mentioned users cannot access this file: " + ", ".join(invalid))
 
@@ -170,7 +171,8 @@ class Toolset:
         self._require_read(ident, file_uid)
         if not reviewers:
             raise ToolError("at least one reviewer is required")
-        valid, invalid = validate_targets(self.c.directory, self.c.permissions, file_uid, reviewers)
+        valid, invalid = validate_targets(self.c.directory, self.c.permissions, file_uid, reviewers,
+                                         ident.tenant)
         if invalid:
             raise ToolError("some reviewers cannot access this file: " + ", ".join(invalid))
         reviews = self.c.reviews.create(ident.tenant, file_uid=file_uid, version=version,

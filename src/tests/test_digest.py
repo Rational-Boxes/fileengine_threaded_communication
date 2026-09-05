@@ -70,8 +70,10 @@ class FakeActivity:
 
 
 class FakeDirectory:
-    def resolve_principal(self, identifier):
-        return Identity(user=identifier, roles=["users"], tenant="default",
+    def resolve_principal(self, identifier, tenant=None):
+        # Honours the tenant asked for, as the real directory does — the digest
+        # resolves its recipient IN the tenant it is sending for.
+        return Identity(user=identifier, roles=["users"], tenant=tenant or "default",
                         email=f"{identifier}@x.test")
 
 

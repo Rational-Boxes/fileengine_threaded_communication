@@ -32,7 +32,14 @@ from .ldap_auth import Identity
 
 
 def validate_targets(directory, permissions, file_uid: str,
-                     identifiers) -> Tuple[List[Tuple[str, Identity]], List[str]]:
+                     identifiers,
+                     tenant: str = "") -> Tuple[List[Tuple[str, Identity]], List[str]]:
+    """Resolve each identifier and keep those who can READ ``file_uid``.
+
+    ``tenant`` is the tenant the check runs in — the request's, not the service's
+    configured one. Without it every target resolved into the configured tenant's
+    schema and failed the READ check there, so a mention or a review named
+    anybody outside that tenant was rejected as "cannot access this file"."""
     valid: List[Tuple[str, Identity]] = []
     invalid: List[str] = []
     seen: set[str] = set()
@@ -41,7 +48,7 @@ def validate_targets(directory, permissions, file_uid: str,
         if not key or key in seen:
             continue
         seen.add(key)
-        principal = directory.resolve_principal(key)
+        principal = directory.resolve_principal(key, tenant=tenant or None)
         if principal is None or not permissions.can_read(principal, file_uid):
             invalid.append(key)
         else:

@@ -102,10 +102,11 @@ class DigestSender:
 
     # -- per-subscription ---------------------------------------------------
     def _recipient(self, sub: dict, tenant: str) -> Optional[Identity]:
-        ident = self.directory.resolve_principal(sub["user_id"])
+        # Resolved IN the tenant rather than re-stamped after: the principal is
+        # used for ACL-filtered reads, and resolve_principal now scopes it.
+        ident = self.directory.resolve_principal(sub["user_id"], tenant=tenant)
         if ident is None:
             return None
-        ident.tenant = tenant
         return ident
 
     def process(self, tenant: str, sub: dict, now_utc: _dt.datetime) -> str:

@@ -61,7 +61,8 @@ async def raise_review(file_uid: str, request: Request, body: dict = Body(...),
         raise HTTPException(status_code=422, detail="at least one reviewer is required")
 
     valid, invalid = await run_in_threadpool(
-        validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid, reviewers)
+        validate_targets, _s(request, "directory"), _s(request, "permissions"), file_uid,
+        reviewers, ident.tenant)
     if invalid:
         # Error-mark: reject the submit, name the reviewers who lack access (§5.1).
         raise HTTPException(status_code=422,
