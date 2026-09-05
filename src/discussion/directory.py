@@ -47,6 +47,41 @@ from .ldap_auth import Identity
 log = logging.getLogger("discussion.directory")
 
 
+def _tenant_role_base(cfg, tenant: str) -> str:
+    """Where this tenant's groups live: ``ou=<tenant>,<tenant_base>``.
+
+    Roles are per tenant and their CNs REPEAT across tenants — `administrators`,
+    `engineering` and `accounting` all exist under more than one `ou=` on the
+    deployment. Searching the whole tenant base therefore returns a union: a
+    user who is `administrators` in one tenant looked like an administrator in
+    every tenant. Scoping the base is what makes the answer mean "in THIS
+    tenant"."""
+    return f"ou={tenant},{cfg.ldap_tenant_base}"
+
+
+def _roles_in_tenant(svc, cfg, user_dn: str, tenant: str) -> list[str]:
+    """The user's groups within ``tenant``. Empty means NOT A MEMBER.
+
+    That emptiness is the membership test used by both lookups below. There is
+    no separate "is a member" record to consult — belonging to a tenant IS
+    holding at least one group beneath its ou."""
+    roles: list[str] = []
+    try:
+        svc.search(_tenant_role_base(cfg, tenant),
+                   f"(&(objectClass=groupOfNames)(member={user_dn}))",
+                   search_scope=SUBTREE, attributes=["cn"])
+    except LDAPException:
+        log.warning("directory: role lookup failed for %s in %s", user_dn, tenant, exc_info=True)
+        return []
+    for e in svc.entries:
+        cn = str(e.cn)
+        if cn and cn not in roles:
+            roles.append(cn)
+    if "administrators" in roles and "system_admin" not in roles:
+        roles.append("system_admin")
+    return roles
+
+
 class Directory:
     def __init__(self, config):
         self.config = config
@@ -77,18 +112,17 @@ class Directory:
             email = str(entry.mail) if "mail" in entry and entry.mail else (
                 identifier if "@" in identifier else "")
 
-            roles: list[str] = []
-            svc.search(cfg.ldap_tenant_base,
-                       f"(&(objectClass=groupOfNames)(member={user_dn}))",
-                       search_scope=SUBTREE, attributes=["cn"])
-            for e in svc.entries:
-                cn = str(e.cn)
-                if cn and cn not in roles:
-                    roles.append(cn)
-            if "administrators" in roles and "system_admin" not in roles:
-                roles.append("system_admin")
+            scope = tenant or cfg.tenant
+            roles = _roles_in_tenant(svc, cfg, user_dn, scope)
+            if not roles:
+                # Not a member of this tenant. Refused rather than returned
+                # role-less: the caller's only other filter is an ACL check, and
+                # the core is read-by-default, so a role-less outsider passes it
+                # and could be mentioned into a document in a tenant they have
+                # nothing to do with.
+                return None
 
-            return Identity(user=uid, roles=roles, tenant=tenant or cfg.tenant,
+            return Identity(user=uid, roles=roles, tenant=scope,
                             authenticated=False, email=email)
         except LDAPException:
             log.warning("directory: lookup failed for %s", identifier, exc_info=True)
@@ -98,10 +132,22 @@ class Directory:
 
     def search(self, query: str, limit: int = 8,
                tenant: Optional[str] = None) -> list[Identity]:
-        """Candidate users matching ``query`` (uid/email/name substring), with roles
-        resolved — for @mention autocomplete. The caller ACL-filters by the anchor
-        (§5.1), which is why ``tenant`` matters here: it is the tenant that filter
-        runs in. Returns [] on empty query or an unreachable directory."""
+        """Members of ``tenant`` matching ``query`` (uid/email/name substring),
+        with their roles IN that tenant — for @mention autocomplete.
+
+        MEMBERS ONLY. The LDAP user base is shared by every tenant, so the
+        substring match alone returns strangers: on the deployment, a search for
+        "a" on one tenant offered seven people, three of whom belonged to
+        another tenant entirely. Their names and addresses were shown to users
+        with no relationship to them.
+
+        The ACL filter the caller applies afterwards does NOT cover this. The
+        core is read-by-default, so a principal with no roles passes a READ check
+        on any document without a matching deny rule — which is exactly what an
+        outsider is. Membership has to be established here, and it is: no roles
+        in this tenant, no place in the list.
+
+        Returns [] on empty query or an unreachable directory."""
         cfg = self.config
         q = (query or "").strip()
         if not q:
@@ -112,8 +158,12 @@ class Directory:
         except LDAPException:
             log.warning("directory: service bind failed", exc_info=True)
             return []
+        scope = tenant or cfg.tenant
         out: list[Identity] = []
         try:
+            # The directory is shared by every tenant, so this matches people the
+            # caller must never be shown. _roles_in_tenant below is the filter
+            # that makes the result "members of THIS tenant" — see the docstring.
             svc.search(cfg.ldap_user_base, f"(|(uid=*{q}*)(mail=*{q}*)(cn=*{q}*))",
                        search_scope=SUBTREE, attributes=["uid", "cn", "mail"], size_limit=limit * 4)
             for entry in svc.entries[:limit]:
@@ -121,17 +171,10 @@ class Directory:
                 if not uid:
                     continue
                 email = str(entry.mail) if "mail" in entry and entry.mail else ""
-                roles: list[str] = []
-                svc.search(cfg.ldap_tenant_base,
-                           f"(&(objectClass=groupOfNames)(member={entry.entry_dn}))",
-                           search_scope=SUBTREE, attributes=["cn"])
-                for e in svc.entries:
-                    cn = str(e.cn)
-                    if cn and cn not in roles:
-                        roles.append(cn)
-                if "administrators" in roles and "system_admin" not in roles:
-                    roles.append("system_admin")
-                out.append(Identity(user=uid, roles=roles, tenant=tenant or cfg.tenant,
+                roles = _roles_in_tenant(svc, cfg, entry.entry_dn, scope)
+                if not roles:
+                    continue     # not a member of this tenant — never offered
+                out.append(Identity(user=uid, roles=roles, tenant=scope,
                                     authenticated=False, email=email))
         except LDAPException:
             log.warning("directory: search failed for %s", q, exc_info=True)

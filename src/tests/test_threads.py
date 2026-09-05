@@ -188,26 +188,36 @@ class FakePerms:
 
 
 class FakeDirectory:
-    """Stamps the tenant it is ASKED for, as the real directory does.
+    """Members of the tenant it is ASKED for, as the real directory does.
 
     It used to hard-code "default", which is why the tenant defect was invisible
     here: the fake answered in the configured tenant no matter what the request
     said, and FakePerms did not look at the tenant at all. Between them they
     modelled the one arrangement in which the bug cannot appear."""
-    def __init__(self, mapping=None):
+    def __init__(self, mapping=None, members=None):
         # identifier -> uid; unknown identifiers resolve to None.
         self.mapping = mapping or {}
+        # uid -> the tenants they belong to. Default: every tenant, which keeps
+        # the older tests reading as before. A uid listed here is offered ONLY in
+        # the tenants named, because the real directory refuses a candidate with
+        # no roles under ou=<tenant>.
+        self.members = members or {}
+
+    def _member(self, uid, tenant):
+        allowed = self.members.get(uid)
+        return True if allowed is None else (tenant or "default") in allowed
 
     def resolve_principal(self, identifier, tenant=None):
         uid = self.mapping.get(identifier)
-        return None if uid is None else Identity(user=uid, roles=["users"],
-                                                 tenant=tenant or "default")
+        if uid is None or not self._member(uid, tenant):
+            return None
+        return Identity(user=uid, roles=["users"], tenant=tenant or "default")
 
     def search(self, q, limit=8, tenant=None):
         ql = (q or "").lower()
         out = [Identity(user=uid, roles=["users"], tenant=tenant or "default", email=ident)
                for ident, uid in self.mapping.items()
-               if ql in ident.lower() or ql in uid.lower()]
+               if (ql in ident.lower() or ql in uid.lower()) and self._member(uid, tenant)]
         return out[:limit]
 
 
@@ -501,6 +511,50 @@ def test_reviewers_resolve_in_the_requested_tenant(make):
     valid, invalid = validate_targets(c.directory, FakePerms(reads=True, file_tenant="arcdigital"),
                                       "f1", ["carol@x"], "arcdigital")
     assert invalid == [] and [p.user for _i, p in valid] == ["carol"]
+
+
+# --- members only (production disclosure, 2026-09-05) -----------------------
+#
+# The LDAP user base is shared by every tenant, and the substring match alone
+# returns strangers. On the deployment a search for "a" on one tenant offered
+# seven people, three of them members of a different tenant — names and email
+# addresses shown to users with no relationship to them.
+#
+# The ACL filter does not cover this: the core is read-by-default, so a
+# role-less outsider passes a READ check on any document without a deny rule.
+# Membership is established in the directory, by having roles in that tenant.
+def test_autocomplete_offers_only_members_of_the_active_tenant(make):
+    directory = FakeDirectory({"carol@x": "carol", "outsider@x": "outsider"},
+                              members={"carol": {"arcdigital"}, "outsider": {"default"}})
+    c = make(reads=True, file_tenant="arcdigital", directory=directory)
+
+    users = c.client.get("/files/f1/mentionable?q=outsider",
+                         headers={**_auth("bob"), **TENANT_HDR}).json()["users"]
+    assert users == []                               # matches the query, is not a member
+
+    users = c.client.get("/files/f1/mentionable?q=car",
+                         headers={**_auth("bob"), **TENANT_HDR}).json()["users"]
+    assert [u["user"] for u in users] == ["carol"]   # ...a member still is
+
+    # And the outsider is absent from a query that matches them BOTH, which is
+    # the shape the disclosure actually took — a broad prefix, a mixed list.
+    users = c.client.get("/files/f1/mentionable?q=o",
+                         headers={**_auth("bob"), **TENANT_HDR}).json()["users"]
+    assert "outsider" not in [u["user"] for u in users]
+
+
+def test_a_non_member_cannot_be_mentioned_even_if_named_directly(make):
+    # Defence in depth: the dropdown is a convenience, the address bar is not.
+    directory = FakeDirectory({"outsider@x": "outsider"}, members={"outsider": {"default"}})
+    c = make(reads=True, file_tenant="arcdigital", directory=directory)
+
+    r = c.client.post("/files/f1/threads",
+                      json={"body": "hi @outsider@x", "mentions": ["outsider@x"]},
+                      headers={**_auth("bob"), **TENANT_HDR})
+
+    assert r.status_code == 422
+    assert r.json()["detail"]["invalid_mentions"] == ["outsider@x"]
+    assert c.notes.kinds_for("outsider") == []       # and nothing was flagged to them
 
 
 def test_thread_provenance_endpoint(make):
