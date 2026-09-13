@@ -26,11 +26,13 @@ from discussion.ldap_auth import Identity
 @pytest.fixture
 def app(monkeypatch):
     # A fake LDAP authenticate: 'admin'/'pw' -> admin identity, 'bob'/'pw' -> user.
-    def fake_auth(cfg, username, password):
+    def fake_auth(cfg, username, password, tenant=None):
+        # Roles are resolved FOR a tenant, so the stand-in scopes to it too.
+        tenant = tenant or cfg.tenant
         if password != "pw" or username not in ("admin", "bob"):
-            return Identity(user=username, tenant=cfg.tenant, authenticated=False)
+            return Identity(user=username, tenant=tenant, authenticated=False)
         roles = ["administrators", "system_admin"] if username == "admin" else ["users"]
-        return Identity(user=username, roles=roles, tenant=cfg.tenant, authenticated=True)
+        return Identity(user=username, roles=roles, tenant=tenant, authenticated=True)
 
     # Patch every module that imported `authenticate` by name.
     monkeypatch.setattr("discussion.api.authenticate", fake_auth)
@@ -55,12 +57,19 @@ def test_whoami_requires_auth(client):
 
 
 def test_auth_token_then_whoami(client):
-    r = client.post("/auth/token", json={"username": "bob", "password": "pw"})
+    """A token from /auth/token is bound to the tenant it was issued FOR.
+
+    It used to be per-request: the tenant was not baked into the token and
+    `resolve_identity` re-stamped whatever `X-Tenant` said, so a token minted
+    against one tenant served requests against another while still carrying the
+    roles resolved at issue time. Roles are per tenant, so that is a
+    cross-tenant grant. Ask for the tenant you want at issue time instead.
+    """
+    r = client.post("/auth/token", json={"username": "bob", "password": "pw"},
+                    headers={"X-Tenant": "acme"})
     assert r.status_code == 200
     token = r.json()["access_token"]
 
-    # Tenant is per-request (X-Tenant), not baked into the token — one account can
-    # act across tenants. So whoami reflects the request's tenant.
     who = client.get("/whoami", headers={"Authorization": f"Bearer {token}",
                                          "X-Tenant": "acme"})
     assert who.status_code == 200
@@ -68,6 +77,16 @@ def test_auth_token_then_whoami(client):
     assert body["user"] == "bob"
     assert body["tenant"] == "acme"
     assert body["is_admin"] is False
+
+
+def test_own_token_does_not_carry_into_another_tenant(client):
+    """The same token, presented against a tenant it was not issued for."""
+    r = client.post("/auth/token", json={"username": "bob", "password": "pw"},
+                    headers={"X-Tenant": "acme"})
+    token = r.json()["access_token"]
+    who = client.get("/whoami", headers={"Authorization": f"Bearer {token}",
+                                         "X-Tenant": "other"})
+    assert who.status_code == 401
 
 
 def test_auth_token_bad_credentials(client):
