@@ -28,6 +28,8 @@ keeping all attention/activity surfaces consistent (§10a).
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from functools import partial
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -88,22 +90,61 @@ async def mark_seen(notification_id: int, request: Request,
     return {"seen": bool(ok)}
 
 
+def _activity_from_core(config, ident: Identity, limit: int) -> list[dict]:
+    """Ask the core what changed, instead of assembling it from events here.
+
+    This used to read `document_activity` — a projection fed by an event for
+    every file touched — over-fetch four times the page, and then make TWO
+    permission calls per row: up to 800 round trips for one page, each building
+    and closing a core client. It is the endpoint that returned 504 under load.
+
+    The core holds the files, their versions and their ACLs, so it can answer
+    the whole question in one query, already filtered to what this identity may
+    read. `examined` minus the number returned is how much recent activity the
+    caller cannot see; `scan_truncated` says a short page means the scan bound
+    was reached rather than that there is nothing older.
+    """
+    from .core_client import client_for
+    mf = client_for(ident, config)
+    try:
+        res = mf.list_recent_files(limit=limit, tenant=ident.tenant)
+    finally:
+        try:
+            mf.close()
+        except Exception:
+            pass
+
+    items: list[dict] = []
+    for i, e in enumerate(res.get("entries", [])):
+        ts = e.get("modified_at") or 0
+        items.append({
+            # The shape the SPA already maps (discussionService.toActivity).
+            # `id` is positional: these rows are a query result now, not stored
+            # projection rows with identities of their own.
+            "id": i,
+            "file_uid": e.get("uid", ""),
+            # One version means the file is new; more means it was updated. The
+            # projection recorded this as an event type; the core reports the
+            # count, which says the same thing without needing the events.
+            "event_type": "created" if (e.get("version_count") or 0) <= 1 else "updated",
+            "version": e.get("version", ""),
+            "name": e.get("name", ""),
+            # No path: producing one costs an ancestor walk per row in the core,
+            # which is the cost this whole change exists to remove. The SPA
+            # already treats it as optional.
+            "path": "",
+            "actor": e.get("modified_by", ""),
+            "ts": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else "",
+        })
+    return items
+
+
 @router.get("/dashboard/activity")
 async def activity(request: Request, limit: int = Query(50, ge=1, le=200),
                    ident: Identity = Depends(identity)) -> dict:
-    # Over-fetch then filter so the returned page is all readable AND live to the
-    # caller: drop rows the caller can't READ, and drop soft-deleted files (an item
-    # deleted before its file.deleted event was pruned, or recorded pre-fix). The
-    # cheap cached READ check runs first; is_live only for rows that survive it.
-    rows = await run_in_threadpool(partial(
-        _s(request, "activity").recent, ident.tenant, limit=limit * 4))
-    out = []
-    for r in rows:
-        if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
-            out.append(r)
-            if len(out) >= limit:
-                break
-    return {"items": out}
+    items = await run_in_threadpool(
+        partial(_activity_from_core, request.app.state.config, ident, limit))
+    return {"items": items}
 
 
 @router.post("/attention/flags")
