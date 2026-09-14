@@ -56,6 +56,16 @@ class _FakeConn:
         pass
 
 
+def _is_admin(ident) -> bool:
+    """Admin-ness, however this service spells it.
+
+    Some copies expose an `is_admin` property; the rest carry the roles only.
+    Either way an admin is someone holding an admin role IN the tenant."""
+    if hasattr(ident, "is_admin"):
+        return bool(ident.is_admin)
+    return bool({"administrators", "system_admin"} & set(ident.roles or []))
+
+
 def _cfg(**kw):
     c = types.SimpleNamespace(
         ldap_tenant_base="ou=tenants,dc=x",
@@ -92,7 +102,7 @@ def test_administrators_in_one_tenant_is_not_an_admin_in_another():
     beta = tenant_access.roles_in_tenant(conn, cfg, "uid=alice", "beta")
     assert "system_admin" in alpha          # mapped from `administrators`
     assert beta == []                       # and NOT carried into beta
-    assert not ldap_auth.Identity(user="a", roles=beta).is_admin
+    assert not _is_admin(ldap_auth.Identity(user="a", roles=beta))
 
 
 def test_role_lookup_failure_fails_closed():
@@ -166,7 +176,7 @@ def test_service_principal_reaches_any_tenant_but_holds_no_roles(monkeypatch):
     ident = ldap_auth._authenticate_against("ldap://x", cfg, "SVC@Platform.test", "pw", "beta")
     assert ident.authenticated          # infrastructure reaches every tenant
     assert ident.roles == []            # but is never a role-holder
-    assert not ident.is_admin
+    assert not _is_admin(ident)
 
 
 def test_service_principal_match_is_case_insensitive():
