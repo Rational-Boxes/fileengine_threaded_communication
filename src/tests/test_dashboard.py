@@ -119,26 +119,93 @@ def test_mark_seen(make):
     assert c.client.post("/dashboard/attention/5/seen", headers=_auth("bob")).json()["seen"] is False
 
 
-def test_activity_feed_is_acl_filtered(make):
-    rows = [{"id": 1, "file_uid": "f1", "event_type": "updated", "version": "v2", "name": "a",
-             "path": "/a", "actor": "carol", "ts": "t"},
-            {"id": 2, "file_uid": "fX", "event_type": "created", "version": "", "name": "b",
-             "path": "/b", "actor": "carol", "ts": "t"}]
-    c = make(reads={"f1"}, activity=rows)
-    items = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"]
-    assert [i["file_uid"] for i in items] == ["f1"]
+# ── the activity feed now asks the core ─────────────────────────────────────
+#
+# It used to read `document_activity` — a projection fed by an event for every
+# file touched — over-fetch four times the page, and make TWO permission calls
+# per row. ACL filtering and the soft-deleted guard have moved INTO the core's
+# ListRecentFiles, which applies them in the query; they are covered there by
+# acl_subtree_live_tests against a real database.
+#
+# What is left to test here is the contract this service still owns: that it
+# asks the core as the CALLER, and that it maps the answer into the shape the
+# SPA reads — including turning a version count into an event type.
+
+class _FakeCore:
+    """Stands in for the gRPC client. Records how it was asked."""
+
+    def __init__(self, entries):
+        self._entries = entries
+        self.calls = []
+        self.closed = False
+
+    def list_recent_files(self, **kw):
+        self.calls.append(kw)
+        return {"entries": self._entries, "examined": len(self._entries) * 2,
+                "scan_truncated": False}
+
+    def close(self):
+        self.closed = True
 
 
-def test_activity_feed_excludes_deleted(make):
-    # Both readable, but f2 is soft-deleted → it must not appear even though a stale
-    # activity row still references it (read-time is_live guard).
-    rows = [{"id": 1, "file_uid": "f1", "event_type": "updated", "version": "v2", "name": "a",
-             "path": "/a", "actor": "carol", "ts": "t"},
-            {"id": 2, "file_uid": "f2", "event_type": "created", "version": "", "name": "b",
-             "path": "/b", "actor": "carol", "ts": "t"}]
-    c = make(reads=True, live={"f1"}, activity=rows)   # f2 not live (deleted)
+@pytest.fixture
+def core(monkeypatch):
+    holder = {}
+
+    def _install(entries):
+        fake = _FakeCore(entries)
+        holder["fake"] = fake
+        monkeypatch.setattr("discussion.core_client.client_for", lambda ident, cfg: fake)
+        return fake
+    return _install
+
+
+def test_activity_is_answered_by_the_core(make, core):
+    fake = core([
+        {"uid": "f1", "name": "a", "version": "20260101_000000.000", "version_count": 3,
+         "size": 10, "modified_at": 1767225600, "modified_by": "carol", "owner": "carol"},
+        {"uid": "f2", "name": "b", "version": "20260102_000000.000", "version_count": 1,
+         "size": 20, "modified_at": 1767312000, "modified_by": "dave", "owner": "dave"},
+    ])
+    c = make(activity=[{"id": 99, "file_uid": "SHOULD-NOT-APPEAR", "event_type": "updated",
+                        "version": "", "name": "stale", "path": "", "actor": "x", "ts": "t"}])
     items = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"]
-    assert [i["file_uid"] for i in items] == ["f1"]
+
+    assert [i["file_uid"] for i in items] == ["f1", "f2"]
+    # The local projection is no longer consulted — a row only it holds must not
+    # surface. This is the assertion that would fail if the old path came back.
+    assert "SHOULD-NOT-APPEAR" not in [i["file_uid"] for i in items]
+    assert fake.closed, "the core client is released"
+
+
+def test_event_type_comes_from_the_version_count(make, core):
+    core([
+        {"uid": "f1", "name": "new", "version": "v", "version_count": 1,
+         "size": 0, "modified_at": 1767225600, "modified_by": "carol", "owner": "carol"},
+        {"uid": "f2", "name": "changed", "version": "v", "version_count": 7,
+         "size": 0, "modified_at": 1767225600, "modified_by": "carol", "owner": "carol"},
+    ])
+    c = make()
+    items = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"]
+    assert items[0]["event_type"] == "created", "one version means the file is new"
+    assert items[1]["event_type"] == "updated", "more than one means it changed"
+
+
+def test_the_core_is_asked_as_the_caller(make, core):
+    fake = core([])
+    c = make()
+    c.client.get("/dashboard/activity?limit=25", headers=_auth("bob"))
+    assert fake.calls, "the core was asked"
+    assert fake.calls[0]["limit"] == 25, "the caller's limit is passed through, not a fixed page"
+
+
+def test_timestamps_are_iso_utc(make, core):
+    core([{"uid": "f1", "name": "a", "version": "v", "version_count": 2, "size": 0,
+           "modified_at": 1767225600, "modified_by": "carol", "owner": "carol"}])
+    c = make()
+    ts = c.client.get("/dashboard/activity", headers=_auth("bob")).json()["items"][0]["ts"]
+    assert ts.startswith("2025-12-31") or ts.startswith("2026-01-01"), ts
+    assert ts.endswith("+00:00"), "UTC, explicitly — the SPA renders it in local time"
 
 
 def test_attention_flags_batch(make):
