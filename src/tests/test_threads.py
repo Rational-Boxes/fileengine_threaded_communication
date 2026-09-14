@@ -271,11 +271,17 @@ class Ctx:
 KNOWN = {"bob", "carol", "admin"}
 
 
-def _fake_auth(cfg, username, password):
+def _fake_auth(cfg, username, password, tenant=None):
+    """Stands in for ldap_auth.authenticate, which resolves roles FOR a tenant.
+
+    The tenant is part of the contract, not decoration: roles are the groups
+    held in that tenant, so the fake scopes its answer the same way the real
+    one does."""
+    tenant = tenant or cfg.tenant
     if password != "pw" or username not in KNOWN:
-        return Identity(user=username, tenant=cfg.tenant, authenticated=False)
+        return Identity(user=username, tenant=tenant, authenticated=False)
     roles = ["administrators", "system_admin"] if username == "admin" else ["users"]
-    return Identity(user=username, roles=roles, tenant=cfg.tenant, authenticated=True)
+    return Identity(user=username, roles=roles, tenant=tenant, authenticated=True)
 
 
 def _auth(user):

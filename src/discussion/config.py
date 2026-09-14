@@ -89,6 +89,10 @@ class Config:
         # for a user-facing read). Every user request is evaluated as the end user.
         self.tenant = _env("FILEENGINE_DISC_TENANT", "default")
         self.agent_user = _first("FILEENGINE_DISC_USER", "FILEENGINE_LDAP_USER", "")
+        # Infrastructure identities exempt from the tenant-membership rule (they
+        # are not members of anything). Comma-separated; the service's own agent
+        # is always included. They carry NO tenant roles — see tenant_access.
+        self.service_principals = _env("FILEENGINE_SERVICE_PRINCIPALS", "")
         self.agent_password = _first("FILEENGINE_DISC_PASSWORD", "FILEENGINE_LDAP_PASSWORD", "")
 
         # --- LDAP — the auth/role authority (mirrors CSAI + the bridges) ---

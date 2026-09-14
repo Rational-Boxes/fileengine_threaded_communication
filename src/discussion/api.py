@@ -107,11 +107,13 @@ async def auth_token(request: Request, body: dict = Body(...)) -> JSONResponse:
     tenant = (request.headers.get("x-tenant") or config.tenant).strip()
     username = (body or {}).get("username", "")
     password = (body or {}).get("password", "")
-    ident = await run_in_threadpool(authenticate, config, username, password)
+    # Authenticate FOR the requested tenant: a bind proves who you are, holding a
+    # group in `tenant` proves you may act there. Issuing against a tenant the
+    # caller is not a member of minted a token that read another tenant's data.
+    ident = await run_in_threadpool(authenticate, config, username, password, tenant)
     if not ident.authenticated:
         return JSONResponse({"detail": "invalid credentials"}, status_code=401)
-    from dataclasses import replace
-    token = request.app.state.token_store.issue(replace(ident, tenant=tenant))
+    token = request.app.state.token_store.issue(ident)
     return JSONResponse({"access_token": token, "token_type": "bearer"})
 
 

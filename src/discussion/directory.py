@@ -42,44 +42,16 @@ from typing import Optional
 from ldap3 import Server, Connection, ALL, SUBTREE
 from ldap3.core.exceptions import LDAPException
 
+from .tenant_access import roles_in_tenant, tenant_role_base
 from .ldap_auth import Identity
 
 log = logging.getLogger("discussion.directory")
 
 
-def _tenant_role_base(cfg, tenant: str) -> str:
-    """Where this tenant's groups live: ``ou=<tenant>,<tenant_base>``.
-
-    Roles are per tenant and their CNs REPEAT across tenants — `administrators`,
-    `engineering` and `accounting` all exist under more than one `ou=` on the
-    deployment. Searching the whole tenant base therefore returns a union: a
-    user who is `administrators` in one tenant looked like an administrator in
-    every tenant. Scoping the base is what makes the answer mean "in THIS
-    tenant"."""
-    return f"ou={tenant},{cfg.ldap_tenant_base}"
-
-
-def _roles_in_tenant(svc, cfg, user_dn: str, tenant: str) -> list[str]:
-    """The user's groups within ``tenant``. Empty means NOT A MEMBER.
-
-    That emptiness is the membership test used by both lookups below. There is
-    no separate "is a member" record to consult — belonging to a tenant IS
-    holding at least one group beneath its ou."""
-    roles: list[str] = []
-    try:
-        svc.search(_tenant_role_base(cfg, tenant),
-                   f"(&(objectClass=groupOfNames)(member={user_dn}))",
-                   search_scope=SUBTREE, attributes=["cn"])
-    except LDAPException:
-        log.warning("directory: role lookup failed for %s in %s", user_dn, tenant, exc_info=True)
-        return []
-    for e in svc.entries:
-        cn = str(e.cn)
-        if cn and cn not in roles:
-            roles.append(cn)
-    if "administrators" in roles and "system_admin" not in roles:
-        roles.append("system_admin")
-    return roles
+# The membership rule itself lives in tenant_access, shared with the credential
+# paths so both answer "is this principal a member of THIS tenant" identically.
+_tenant_role_base = tenant_role_base
+_roles_in_tenant = roles_in_tenant
 
 
 class Directory:
