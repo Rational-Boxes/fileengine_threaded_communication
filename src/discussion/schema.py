@@ -181,7 +181,9 @@ ALTER TABLE "{schema}".notifications ADD CONSTRAINT notifications_kind_check
     CHECK (kind IN ('mention','reply','review_requested','review_acknowledged',
                     'review_completed','review_approved','review_rejected','thread_resolved',
                     'share_drop_received','share_link_dead','share_otp_send_failed',
-                    'share_first_redemption','share_link_locked'));
+                    'share_first_redemption','share_link_locked',
+                    'share_media_opened','share_media_completed','share_media_popular',
+                    'share_media_parked'));
 
 -- Share-link attention items (share_service, spec §10.6). Two columns:
 --
