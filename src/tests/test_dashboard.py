@@ -14,6 +14,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Dashboard feeds, attention flags & comment resolve (M4a) — hermetic."""
+import types
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -282,3 +284,55 @@ def test_ordinary_rows_are_still_filtered(make):
     c = make(reads=set(), notes=rows)
     assert c.client.get("/dashboard/attention",
                         headers=_auth("bob")).json()["items"] == []
+
+
+# --- attention rows name their document (owner's request 2026-10-05) ----------
+
+class _NamingCore:
+    """stat() as the user: names for the files it will answer for."""
+    def __init__(self, names):
+        self.names, self.asked, self.closed = names, [], False
+
+    def stat(self, uid):
+        self.asked.append(uid)
+        if uid not in self.names:
+            raise LookupError(uid)
+        return types.SimpleNamespace(name=self.names[uid])
+
+    def close(self):
+        self.closed = True
+
+
+def _note(i, kind, uid, **kw):
+    return {"id": i, "user_id": "bob", "kind": kind, "file_uid": uid, "thread_id": "t",
+            "review_id": None, "actor": "carol@example.com", "created_at": "t", "read_at": None, **kw}
+
+
+def test_a_mention_carries_the_file_name(make, monkeypatch):
+    fake = _NamingCore({"f1": "Site plan rev C.pdf"})
+    monkeypatch.setattr("discussion.core_client.client_for", lambda ident, cfg: fake)
+    c = make(reads=True, live=True, notes=[_note(1, "mention", "f1"), _note(2, "reply", "f1")])
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert [i["file_name"] for i in items] == ["Site plan rev C.pdf", "Site plan rev C.pdf"]
+    assert items[0]["actor"] == "carol@example.com"           # who, as before
+    assert fake.asked == ["f1"] and fake.closed               # one lookup per file, one connection
+
+
+def test_a_name_the_core_will_not_give_is_absent_not_an_error(make, monkeypatch):
+    fake = _NamingCore({})
+    monkeypatch.setattr("discussion.core_client.client_for", lambda ident, cfg: fake)
+    c = make(reads=True, live=True, notes=[_note(1, "mention", "f9")])
+    r = c.client.get("/dashboard/attention", headers=_auth("bob"))
+    assert r.status_code == 200
+    assert r.json()["items"][0]["file_name"] is None
+
+
+def test_a_share_row_is_never_resolved(make, monkeypatch):
+    # Raised because the creator may have LOST access — resolving it would leak
+    # (see the READ re-check note in the route).
+    fake = _NamingCore({"f1": "secret.pdf"})
+    monkeypatch.setattr("discussion.core_client.client_for", lambda ident, cfg: fake)
+    c = make(reads=False, live=False,
+             notes=[_note(1, "share_link_dead", "f1", detail_text="Q3 drawings")])
+    items = c.client.get("/dashboard/attention", headers=_auth("bob")).json()["items"]
+    assert "file_name" not in items[0] and fake.asked == []

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import logging
 from functools import partial
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -38,6 +39,7 @@ from fastapi.concurrency import run_in_threadpool
 from .deps import identity
 from .ldap_auth import Identity
 
+log = logging.getLogger("discussion.dashboard")
 router = APIRouter()
 
 
@@ -79,7 +81,44 @@ async def attention(request: Request, limit: int = Query(50, ge=1, le=200),
             continue
         if await _readable(request, ident, r["file_uid"]) and await _live(request, ident, r["file_uid"]):
             out.append(r)
+    # Which document — a mention named only who (owner's request 2026-10-05).
+    # Resolved here, as the user, for rows that already passed READ + live; a
+    # self-contained (share) row is never resolved, for the reason above.
+    uids = sorted({r["file_uid"] for r in out if not r.get("detail_text") and r.get("file_uid")})
+    if uids:
+        names = await run_in_threadpool(_file_names, request.app.state.config, ident, uids)
+        for r in out:
+            if not r.get("detail_text"):
+                r["file_name"] = names.get(r.get("file_uid") or "")
     return {"items": out}
+
+
+def _file_names(config, ident: Identity, uids: list[str]) -> dict:
+    """uid -> name, asked of the core AS THE USER over one connection. A name the
+    core will not give (no access, gone) is simply absent — never an error that
+    costs the user their feed."""
+    from .core_client import client_for
+    try:
+        mf = client_for(ident, config)
+    except Exception:
+        log.warning("attention names: could not build core client", exc_info=True)
+        return {}
+    names: dict = {}
+    try:
+        for uid in uids:
+            try:
+                info = mf.stat(uid)
+                name = getattr(info, "name", "") or ""
+                if name:
+                    names[uid] = name
+            except Exception:
+                continue
+    finally:
+        try:
+            mf.close()
+        except Exception:
+            pass
+    return names
 
 
 @router.post("/dashboard/attention/{notification_id}/seen")
