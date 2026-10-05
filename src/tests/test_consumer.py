@@ -14,6 +14,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Core-event consumer routing (§8 / M4a) — pure handle() logic."""
+import pytest
+
 from discussion.consumer import EventConsumer
 
 
@@ -191,6 +193,36 @@ def test_share_rows_carry_their_own_text():
     c.handle({"type": "share.link_dead", "tenant": "t", "creator": "alice",
               "link_uid": "l4", "detail": "Drawing-A.pdf"})
     assert n.rows[0]["detail_text"] == "Drawing-A.pdf"
+
+
+@pytest.mark.parametrize("event", ["media_opened", "media_completed", "media_popular",
+                                   "media_parked"])
+def test_media_link_events_reach_the_creators_feed(event):
+    """Production 2026-10-04: share published media_completed and this consumer
+    dropped it as an unknown kind, so the creator never learned the recipient
+    had watched. Every media event share can send must land."""
+    c, n, _ = _mk_share()
+    c.handle({"type": f"share.{event}", "tenant": "t", "creator": "james",
+              "actor": "share:l9|pat@example.com", "link_uid": "l9", "file_uid": "v1",
+              "detail": "pat@example.com opened \u201cIntro\u201d"})
+    assert len(n.rows) == 1, f"share.{event} was dropped"
+    assert n.rows[0]["kind"] == f"share_{event}"
+    assert n.rows[0]["share_link_uid"] == "l9" and n.rows[0]["file_uid"] == "v1"
+    assert n.rows[0]["detail_text"].startswith("pat@example.com")
+
+
+def test_every_kind_is_in_the_database_check_too():
+    """KINDS is one of two lists; schema.py's CHECK is the other. A kind in one
+    and not the other is a notification that vanishes — keep them identical."""
+    import re
+    from discussion import schema
+    from discussion.notifications import KINDS, SOURCES
+    src = open(schema.__file__).read()
+    checks = re.findall(r"notifications_kind_check\s+CHECK \(kind IN \(([^)]*)\)\)", src)
+    assert checks, "the kind CHECK was not found"
+    in_db = set(re.findall(r"'([a-z_]+)'", checks[-1]))
+    assert in_db == set(KINDS)
+    assert set(SOURCES) == set(KINDS)
 
 
 def test_an_unknown_share_event_is_dropped_not_written():

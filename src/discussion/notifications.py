@@ -35,7 +35,13 @@ KINDS = ("mention", "reply", "review_requested", "review_acknowledged",
          # Share links (spec §10.6). The feed is one place a user looks; share
          # events join it rather than growing a parallel one.
          "share_drop_received", "share_link_dead", "share_otp_send_failed",
-         "share_first_redemption", "share_link_locked")
+         "share_first_redemption", "share_link_locked",
+         # Media links (MEDIA_SHARE.md). share_service has published
+         # media_completed/popular/parked since MS4, and every one was DROPPED
+         # here as an unknown kind (production 2026-10-04: a creator whose
+         # recipients finished the video saw nothing). media_opened is new.
+         "share_media_opened", "share_media_completed", "share_media_popular",
+         "share_media_parked")
 
 # Which system a kind came from, mapped at WRITE time and returned by the API.
 #
@@ -51,6 +57,8 @@ SOURCES = {
     "share_drop_received": "sharing", "share_link_dead": "sharing",
     "share_otp_send_failed": "sharing", "share_first_redemption": "sharing",
     "share_link_locked": "sharing",
+    "share_media_opened": "sharing", "share_media_completed": "sharing",
+    "share_media_popular": "sharing", "share_media_parked": "sharing",
 }
 
 # The actor recorded for share events that have no external human behind them
